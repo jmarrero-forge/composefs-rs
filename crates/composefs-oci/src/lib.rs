@@ -26,6 +26,7 @@ pub mod layer_sync;
 pub mod layer_transport;
 pub mod oci_image;
 pub mod oci_layout;
+pub mod overlay_upper;
 /// Re-exported from [`composefs::progress`]; use that path directly in new code.
 pub mod progress;
 pub mod skopeo;
