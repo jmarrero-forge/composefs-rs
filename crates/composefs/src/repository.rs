@@ -101,7 +101,7 @@ use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
         Access, AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags,
-        StatVfsMountFlags, accessat, flock, fstatvfs, linkat, mkdirat, openat, readlinkat,
+        StatVfsMountFlags, accessat, flock, fstatvfs, fsync, linkat, mkdirat, openat, readlinkat,
         renameat_with, statat, syncfs, unlinkat,
     },
     io::{Errno, Result as ErrnoResult},
@@ -574,22 +574,47 @@ pub(crate) fn read_repo_metadata(repo_fd: &impl AsFd) -> Result<Option<RepoMetad
 
 /// Enable fs-verity on an fd, dispatching to the correct hash type
 /// based on the [`Algorithm`].
+///
+/// Like [`enable_verity_maybe_copy`], this returns a copy of the file with
+/// fs-verity enabled if another process (such as a child forked by another
+/// thread) still had the file open for writing; the original then has no
+/// fs-verity, so the caller must use the copy in its place.  The copy is
+/// synced to disk, as the callers sync the original.
 fn enable_verity_for_algorithm(
     dirfd: &impl AsFd,
     fd: BorrowedFd,
     algorithm: &Algorithm,
-) -> Result<()> {
-    match algorithm {
+) -> Result<Option<OwnedFd>> {
+    let copy = match algorithm {
         Algorithm::Sha256 { .. } => {
             enable_verity_maybe_copy::<crate::fsverity::Sha256HashValue>(dirfd, fd)
-                .context("enabling verity (sha256)")?;
+                .context("enabling verity (sha256)")?
         }
         Algorithm::Sha512 { .. } => {
             enable_verity_maybe_copy::<crate::fsverity::Sha512HashValue>(dirfd, fd)
-                .context("enabling verity (sha512)")?;
+                .context("enabling verity (sha512)")?
         }
+    };
+    if let Some(copy) = &copy {
+        debug!("enabled fs-verity on a copy, as the file was open for writing elsewhere");
+        fsync(copy).context("syncing the fs-verity copy")?;
     }
-    Ok(())
+    Ok(copy)
+}
+
+/// Replaces the file `name` in `dirfd` with `copy`, the copy with fs-verity
+/// enabled that [`enable_verity_for_algorithm`] returned for it.
+fn link_verity_copy(dirfd: &impl AsFd, name: &str, copy: &OwnedFd) -> Result<()> {
+    unlinkat(dirfd, name, AtFlags::empty())
+        .with_context(|| format!("removing {name} without fs-verity"))?;
+    linkat(
+        CWD,
+        proc_self_fd(copy),
+        dirfd,
+        name,
+        AtFlags::SYMLINK_FOLLOW,
+    )
+    .with_context(|| format!("linking the fs-verity copy of {name}"))
 }
 
 /// Remove algorithm-specific data from a repository directory.
@@ -667,11 +692,14 @@ pub(crate) fn write_repo_metadata(
                 .context("writing metadata to tmpfile")?;
             file.sync_all().context("syncing metadata tmpfile")?;
 
-            let ro_fd = reopen_tmpfile_ro(file).context("re-opening tmpfile read-only")?;
+            let mut ro_fd = reopen_tmpfile_ro(file).context("re-opening tmpfile read-only")?;
 
-            if enable_verity {
-                enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
-                    .context("enabling verity on meta.json")?;
+            if enable_verity
+                && let Some(copy) =
+                    enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
+                        .context("enabling verity on meta.json")?
+            {
+                ro_fd = copy;
             }
 
             linkat(
@@ -707,8 +735,12 @@ pub(crate) fn write_repo_metadata(
                 )
                 .context("re-opening meta.json for verity")?;
                 drop(file);
-                enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
-                    .context("enabling verity on meta.json")?;
+                if let Some(copy) =
+                    enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
+                        .context("enabling verity on meta.json")?
+                {
+                    link_verity_copy(repo_fd, REPO_METADATA_FILENAME, &copy)?;
+                }
             }
         }
         Err(e) => {

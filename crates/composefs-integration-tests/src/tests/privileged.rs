@@ -720,6 +720,123 @@ fn privileged_init_insecure_skips_verity() -> Result<()> {
 }
 integration_test!(privileged_init_insecure_skips_verity);
 
+/// Verify that repositories initialized while another thread forks still
+/// get fs-verity on meta.json.  A child that lingers before exec holds a
+/// copy of the writable meta.json tmpfile, so fs-verity has to be enabled
+/// on a copy of it, and that copy is what must be linked.
+///
+/// Whether a child holds the tmpfile at the right moment is up to the
+/// scheduler, so this keeps initializing repositories until composefs logs
+/// that it made such a copy, and fails if it made none before the deadline.
+/// Without the fix, it failed in 3 of 3 runs.
+fn privileged_init_verity_while_forking() -> Result<()> {
+    use composefs_oci::composefs::fsverity::{Algorithm, measure_verity};
+    use std::cell::Cell;
+    use std::os::unix::process::CommandExt;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Counts the log records of fs-verity copies made on the threads that
+    /// set `COUNTING`, so that other tests running meanwhile don't count.
+    struct CopyCounter;
+    thread_local! {
+        static COUNTING: Cell<bool> = const { Cell::new(false) };
+    }
+    static COPIES: AtomicUsize = AtomicUsize::new(0);
+    impl log::Log for CopyCounter {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Debug && COUNTING.get()
+        }
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata())
+                && record.args().to_string().contains("fs-verity on a copy")
+            {
+                COPIES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    /// Children to fork, enough for many to land while meta.json is written.
+    const FORKS: usize = 100;
+    /// How long each child keeps its copies of the parent's file descriptors.
+    const LINGER: Duration = Duration::from_millis(20);
+    /// When to stop anyway, should forking be slow.
+    const MAX_RUN: Duration = Duration::from_secs(60);
+
+    if require_privileged("privileged_init_verity_while_forking")?.is_some() {
+        return Ok(());
+    }
+
+    log::set_logger(&CopyCounter).map_err(|_| anyhow::anyhow!("another logger is set"))?;
+    log::set_max_level(log::LevelFilter::Debug);
+    let verity_dir = VerityTempDir::new()?;
+    let path = verity_dir.path().join("forking");
+    let stop = AtomicBool::new(false);
+    let forks = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let forker = scope.spawn(|| -> Result<()> {
+            while !stop.load(Ordering::Relaxed) {
+                let mut child = std::process::Command::new("true");
+                // SAFETY: the closure runs in the child between fork and
+                // exec, where it only sleeps, which allocates nothing and
+                // takes no locks.
+                unsafe {
+                    child.pre_exec(|| {
+                        std::thread::sleep(LINGER);
+                        Ok(())
+                    });
+                }
+                child.status().context("running a lingering child")?;
+                forks.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        });
+        let init = || -> Result<(usize, usize)> {
+            let (mut iterations, mut failures) = (0, 0);
+            let start = Instant::now();
+            COUNTING.set(true);
+            while (forks.load(Ordering::Relaxed) < FORKS || COPIES.load(Ordering::Relaxed) == 0)
+                && start.elapsed() < MAX_RUN
+                && !forker.is_finished()
+            {
+                iterations += 1;
+                let (repo, _) = Repository::<Sha256HashValue>::init_path(
+                    rustix::fs::CWD,
+                    &path,
+                    RepositoryConfig::new(Algorithm::SHA256),
+                )?;
+                let meta = std::fs::File::open(path.join("meta.json"))?;
+                if repo.is_insecure() || measure_verity::<Sha256HashValue>(&meta).is_err() {
+                    failures += 1;
+                }
+                drop(repo);
+                std::fs::remove_dir_all(&path)?;
+            }
+            Ok((iterations, failures))
+        };
+        let result = init();
+        stop.store(true, Ordering::Relaxed);
+        forker.join().expect("forking thread panicked")?;
+        let (iterations, failures) = result?;
+        let forks = forks.load(Ordering::Relaxed);
+        let copies = COPIES.load(Ordering::Relaxed);
+        println!("{iterations} repositories initialized during {forks} forks, {copies} copies");
+        ensure!(
+            failures == 0,
+            "{failures} of {iterations} repositories initialized during {forks} forks \
+             have no fs-verity on meta.json"
+        );
+        ensure!(
+            copies > 0,
+            "no child held meta.json open for writing in {iterations} repositories \
+             initialized during {forks} forks, so the copy was never tested"
+        );
+        Ok(())
+    })
+}
+integration_test!(privileged_init_verity_while_forking);
+
 /// Verify that `oci pull` into a read-only bind-mounted repository fails
 /// immediately with a clear "not writable" error instead of a confusing
 /// tar header error.
