@@ -709,6 +709,179 @@ fn privileged_mount_upper_layer() -> Result<()> {
 }
 integration_test!(privileged_mount_upper_layer);
 
+/// An overlay xattr that `privileged_oci_derive_from_upper` sets through the
+/// overlay, which stores it as `trusted.overlay.overlay.test`.
+const ESCAPED_TEST_XATTR: &str = "trusted.overlay.test";
+
+/// Change an image through a writable overlay over its mount (as a package
+/// manager in a staging root would), then `cfsctl oci derive-from-upper` the
+/// overlay's upper and mount the derived image: whiteouts, an opaque
+/// directory, a file capability and a hardlink must all come through, and
+/// an overlay xattr must be unescaped in the layer.
+fn privileged_oci_derive_from_upper() -> Result<()> {
+    if require_privileged("privileged_oci_derive_from_upper")?.is_some() {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let verity_dir = VerityTempDir::new()?;
+    let repo_path = verity_dir.path().join("repo");
+    let repo_arg = repo_path.to_str().unwrap();
+    let cfs = ["--insecure", "--hash", "sha256", "--repo", repo_arg];
+    composefs_oci::test_util::create_test_oci_image(&repo_path, "base:v1")?;
+
+    let work = tempfile::tempdir_in(verity_dir.path())?;
+    let (base, upper, wd, stage, derived) = (
+        work.path().join("base"),
+        work.path().join("upper"),
+        work.path().join("work"),
+        work.path().join("stage"),
+        work.path().join("derived"),
+    );
+    for d in [&base, &upper, &wd, &stage, &derived] {
+        std::fs::create_dir(d)?;
+    }
+    cmd!(sh, "{cfsctl} {cfs...} oci mount base:v1 {base}").run()?;
+    let opts = format!(
+        "lowerdir={},upperdir={},workdir={},metacopy=off,redirect_dir=off,index=off",
+        base.display(),
+        upper.display(),
+        wd.display()
+    );
+    cmd!(sh, "mount -t overlay overlay -o {opts} {stage}").run()?;
+
+    let added: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(stage.join("usr/bin/added"), &added)?;
+    std::fs::hard_link(stage.join("usr/bin/added"), stage.join("usr/bin/added2"))?;
+    // cap_net_raw+ep, VFS_CAP_REVISION_2
+    let cap: [u8; 20] = [
+        1, 0, 0, 2, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    rustix::fs::setxattr(
+        stage.join("usr/bin/added"),
+        "security.capability",
+        &cap,
+        rustix::fs::XattrFlags::empty(),
+    )?;
+    // Set through the overlay, an overlay xattr is stored escaped in the
+    // upper; the layer must have it as the overlay showed it.
+    rustix::fs::setxattr(
+        stage.join("usr/bin/added"),
+        ESCAPED_TEST_XATTR,
+        b"v",
+        rustix::fs::XattrFlags::empty(),
+    )?;
+    std::fs::remove_file(stage.join("usr/share/doc/README"))?;
+    std::fs::remove_dir_all(stage.join("etc"))?;
+    std::fs::create_dir(stage.join("etc"))?;
+    std::fs::write(stage.join("etc/hostname"), "derived\n")?;
+    cmd!(sh, "umount {stage}").run()?;
+
+    use std::os::unix::fs::FileTypeExt;
+    ensure!(
+        std::fs::symlink_metadata(upper.join("usr/share/doc/README"))?
+            .file_type()
+            .is_char_device(),
+        "removing a lower file should leave a whiteout in the upper"
+    );
+    let mut buf = [0u8; 64];
+    let n = rustix::fs::getxattr(
+        upper.join("usr/bin/added"),
+        "trusted.overlay.overlay.test",
+        &mut buf,
+    )
+    .context("the upper should hold the overlay xattr escaped")?;
+    ensure!(buf[..n] == *b"v", "escaped xattr: {:?}", &buf[..n]);
+
+    let digest = cmd!(
+        sh,
+        "{cfsctl} {cfs...} oci derive-from-upper base:v1 {upper} --tag derived:v1 --created-by test --lower {base}"
+    )
+    .read()?;
+    ensure!(
+        digest.starts_with("sha256:"),
+        "unexpected output {digest:?}"
+    );
+    // The layer has the overlay xattr as the overlay showed it. (The image
+    // doesn't: composefs-oci only keeps allowlisted xattrs.)
+    let config: serde_json::Value = serde_json::from_str(
+        &cmd!(sh, "{cfsctl} {cfs...} oci inspect derived:v1 --config").read()?,
+    )?;
+    let layer = config["rootfs"]["diff_ids"]
+        .as_array()
+        .and_then(|ids| ids.last())
+        .and_then(|id| id.as_str())
+        .context("derived image has no layers")?;
+    let dump = cmd!(sh, "{cfsctl} {cfs...} oci layer {layer} --dumpfile").read()?;
+    let added_entry = dump
+        .lines()
+        .find(|l| l.starts_with("/usr/bin/added "))
+        .context("usr/bin/added missing from the layer")?;
+    ensure!(
+        added_entry.contains(&format!(" {ESCAPED_TEST_XATTR}=v"))
+            && !added_entry.contains("trusted.overlay.overlay."),
+        "overlay xattr not unescaped: {added_entry}"
+    );
+    cmd!(sh, "{cfsctl} {cfs...} oci mount derived:v1 {derived}").run()?;
+
+    let check = || -> Result<()> {
+        ensure!(
+            std::fs::read(derived.join("usr/bin/added"))? == added,
+            "added file content"
+        );
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            std::fs::metadata(derived.join("usr/bin/added2"))?.ino()
+                == std::fs::metadata(derived.join("usr/bin/added"))?.ino(),
+            "hardlink lost"
+        );
+        let mut buf = [0u8; 64];
+        let n = rustix::fs::getxattr(
+            derived.join("usr/bin/added"),
+            "security.capability",
+            &mut buf,
+        )?;
+        ensure!(buf[..n] == cap, "capability xattr: {:?}", &buf[..n]);
+        ensure!(
+            !derived.join("usr/share/doc/README").exists(),
+            "whiteout not applied"
+        );
+        let etc: Vec<_> = std::fs::read_dir(derived.join("etc"))?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<std::io::Result<_>>()?;
+        ensure!(
+            etc == ["hostname"],
+            "opaque /etc should only hold hostname: {etc:?}"
+        );
+        ensure!(
+            std::fs::read_to_string(derived.join("etc/hostname"))? == "derived\n",
+            "replaced file content"
+        );
+        ensure!(
+            derived.join("usr/bin/busybox").exists(),
+            "base content missing"
+        );
+        // With --lower, /usr/bin only held changes and keeps the base's metadata.
+        let (b, d) = (
+            std::fs::metadata(base.join("usr/bin"))?,
+            std::fs::metadata(derived.join("usr/bin"))?,
+        );
+        ensure!(
+            (b.mtime(), b.mode()) == (d.mtime(), d.mode()),
+            "/usr/bin metadata changed: {:?} -> {:?}",
+            (b.mtime(), b.mode()),
+            (d.mtime(), d.mode())
+        );
+        Ok(())
+    };
+    let r = check();
+    cmd!(sh, "umount {derived}").run()?;
+    cmd!(sh, "umount {base}").run()?;
+    r
+}
+integration_test!(privileged_oci_derive_from_upper);
+
 /// Verify that `init` on a verity-capable filesystem enables verity on
 /// meta.json, and that `--require-verity` succeeds on such a repo.
 fn privileged_init_enables_verity() -> Result<()> {
