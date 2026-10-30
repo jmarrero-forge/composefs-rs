@@ -1119,6 +1119,72 @@ impl<T> FileSystem<T> {
     }
 }
 
+impl<T: Clone> FileSystem<T> {
+    /// Moves everything below the directory at `path` into a new filesystem.
+    ///
+    /// The directory itself stays in `self`, empty and with its metadata.
+    /// The returned filesystem has the same root metadata and the same
+    /// ancestors of `path` (with their metadata, but no other entries) and
+    /// holds the moved entries at `path`.  Stacking both as overlayfs lower
+    /// layers (see [`crate::image_set`]) shows the original tree again.
+    ///
+    /// A hardlink between the moved subtree and the rest of the tree can't
+    /// span two images, so each side keeps its own copy of such a leaf, with
+    /// the link count of its own side.
+    pub fn split_off(&mut self, path: &OsStr) -> Result<Self, ImageError> {
+        let mut names = Vec::new();
+        for component in Path::new(path).components() {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(name) => names.push(name),
+                Component::Prefix(..) | Component::CurDir | Component::ParentDir => {
+                    return Err(ImageError::InvalidFilename(path.into()));
+                }
+            }
+        }
+        if names.is_empty() {
+            return Err(ImageError::InvalidFilename(path.into()));
+        }
+
+        // The metadata of each directory on the way down, `path` included
+        let mut stats = Vec::with_capacity(names.len());
+        let mut dir = &self.root;
+        for name in &names {
+            dir = match dir.entries.get(*name) {
+                Some(Inode::Directory(subdir)) => subdir,
+                Some(Inode::Leaf(..)) => return Err(ImageError::NotADirectory(path.into())),
+                None => return Err(ImageError::NotFound(path.into())),
+            };
+            stats.push(dir.stat.clone());
+        }
+
+        let moved = std::mem::take(&mut self.root.get_directory_mut(path)?.entries);
+        let mut stats = stats.into_iter().rev();
+        let mut subtree = Directory {
+            stat: stats.next().expect("path has at least one component"),
+            entries: moved,
+        };
+        for (stat, name) in stats.zip(names.iter().rev()) {
+            let mut parent = Directory::new(stat);
+            parent
+                .entries
+                .insert(Box::from(*name), Inode::Directory(Box::new(subtree)));
+            subtree = parent;
+        }
+        let mut root = Directory::new(self.root.stat.clone());
+        root.entries
+            .insert(Box::from(names[0]), Inode::Directory(Box::new(subtree)));
+
+        let mut split = FileSystem {
+            root,
+            leaves: self.leaves.clone(),
+        };
+        split.compact();
+        self.compact();
+        Ok(split)
+    }
+}
+
 /// A read-only view of a [`Directory`] paired with the [`FileSystem`]'s
 /// leaves table, so that leaf-resolving methods don't need a separate
 /// `leaves` parameter.
@@ -2258,6 +2324,118 @@ mod tests {
             XattrFiltering::KeepUserXattrs.to_string(),
             "keep-user-xattrs"
         );
+    }
+
+    #[test]
+    fn test_split_off() {
+        // /usr (mtime 1) /lib (2) /modules (3) /6.12 (4) /foo.ko, plus
+        // /usr/bin/sh and a hardlink between /usr/bin and the modules tree
+        let mut fs = FileSystem::<u32>::new(stat_with_mtime(100));
+        let foo = fs.push_leaf(stat_with_mtime(10), LeafContent::Regular(1));
+        let sh = fs.push_leaf(stat_with_mtime(11), LeafContent::Regular(2));
+        let shared = fs.push_leaf(stat_with_mtime(12), LeafContent::Regular(3));
+        for (path, mtime) in [
+            ("/usr", 1),
+            ("/usr/lib", 2),
+            ("/usr/lib/modules", 3),
+            ("/usr/lib/modules/6.12", 4),
+            ("/usr/bin", 5),
+        ] {
+            let (dir, name) = fs.root.split_mut(OsStr::new(path)).unwrap();
+            dir.insert(name, new_dir_inode(mtime));
+        }
+        for (dir, name, id) in [
+            ("/usr/lib/modules/6.12", "foo.ko", foo),
+            ("/usr/lib/modules/6.12", "shared", shared),
+            ("/usr/bin", "sh", sh),
+            ("/usr/bin", "shared", shared),
+        ] {
+            fs.root
+                .get_directory_mut(OsStr::new(dir))
+                .unwrap()
+                .insert(OsStr::new(name), Inode::leaf(id));
+        }
+
+        let modules = fs.split_off(OsStr::new("/usr/lib/modules")).unwrap();
+
+        // The rest keeps an empty /usr/lib/modules with its metadata
+        let left = fs
+            .root
+            .get_directory(OsStr::new("/usr/lib/modules"))
+            .unwrap();
+        assert_eq!(left.entries.len(), 0);
+        assert_eq!(left.stat.st_mtim_sec, 3);
+        assert!(fs.root.get_directory(OsStr::new("/usr/bin")).is_ok());
+        assert_eq!(fs.leaves.len(), 2);
+        fs.fsck().unwrap();
+
+        // The split tree has the same root and ancestors, and only the subtree
+        assert_eq!(modules.root.stat.st_mtim_sec, 100);
+        assert_eq!(
+            modules
+                .root
+                .entries()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            [OsStr::new("usr")]
+        );
+        for (path, mtime) in [("/usr", 1), ("/usr/lib", 2), ("/usr/lib/modules", 3)] {
+            let dir = modules.root.get_directory(OsStr::new(path)).unwrap();
+            assert_eq!(dir.stat.st_mtim_sec, mtime, "{path}");
+            assert_eq!(dir.entries.len(), 1, "{path}");
+        }
+        let kver = modules
+            .root
+            .get_directory(OsStr::new("/usr/lib/modules/6.12"))
+            .unwrap();
+        let contents = |fs: &FileSystem<u32>, dir: &Directory<u32>, name: &str| match &fs
+            .leaf(dir.leaf_id(OsStr::new(name)).unwrap())
+            .content
+        {
+            LeafContent::Regular(v) => *v,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(contents(&modules, kver, "foo.ko"), 1);
+        assert_eq!(contents(&modules, kver, "shared"), 3);
+        assert_eq!(modules.leaves.len(), 2);
+        modules.fsck().unwrap();
+
+        // The hardlinked leaf now exists on both sides, once each
+        let bin = fs.root.get_directory(OsStr::new("/usr/bin")).unwrap();
+        assert_eq!(contents(&fs, bin, "shared"), 3);
+        assert_eq!(fs.nlinks(), [1, 1]);
+        assert_eq!(modules.nlinks(), [1, 1]);
+    }
+
+    #[test]
+    fn test_split_off_errors() {
+        let mut fs = FileSystem::<u32>::new(default_stat());
+        let leaf = fs.push_leaf(default_stat(), LeafContent::Regular(1));
+        fs.root.insert(OsStr::new("file"), Inode::leaf(leaf));
+        fs.root.insert(OsStr::new("dir"), new_dir_inode(0));
+        let cases = [
+            ("/", ImageError::InvalidFilename(OsStr::new("/").into())),
+            ("", ImageError::InvalidFilename(OsStr::new("").into())),
+            (
+                "/dir/..",
+                ImageError::InvalidFilename(OsStr::new("/dir/..").into()),
+            ),
+            (
+                "/missing",
+                ImageError::NotFound(OsStr::new("/missing").into()),
+            ),
+            (
+                "/file",
+                ImageError::NotADirectory(OsStr::new("/file").into()),
+            ),
+        ];
+        for (path, expected) in cases {
+            let err = fs.split_off(OsStr::new(path)).unwrap_err();
+            assert_eq!(err.to_string(), expected.to_string(), "{path:?}");
+        }
+        // Nothing was moved by the failed attempts
+        assert_eq!(fs.root.entries.len(), 2);
+        assert_eq!(fs.leaves.len(), 1);
     }
 
     #[test]
