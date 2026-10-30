@@ -45,6 +45,7 @@ containers-image-proxy = { version = "0.11", default-features = false }
 hex = "0.4"
 libtest-mimic = "0.8"
 linkme = "0.3"
+log = { version = "0.4.8", default-features = false }
 ocidir = { workspace = true }
 paste = "1"
 rand = { version = "0.10.0", default-features = false, features = ["std"] }

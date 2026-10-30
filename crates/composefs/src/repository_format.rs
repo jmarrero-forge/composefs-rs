@@ -41,6 +41,10 @@
 //! │   ├── 4e67eaccd9fd[...] -> ../objects/4e/67eaccd9fd[...]
 //! │   └── refs
 //! │       └── some/name -> ../../images/4e67eaccd9fd[...]
+//! ├── image-sets
+//! │   ├── 9a3c51e2d0[...] -> ../objects/9a/3c51e2d0[...]
+//! │   └── refs
+//! │       └── some/name -> ../../image-sets/9a3c51e2d0[...]
 //! └── streams
 //!     ├── 502b126bca0c[...] -> ../objects/50/2b126bca0c[...]
 //!     └── refs
@@ -192,6 +196,19 @@
 //! Another way to say it: we must never attempt to mount an arbitrary object: we
 //! may only mount via symlinks present in this directory.
 //!
+//! ## `image-sets/`
+//!
+//! [Image sets][crate::image_set] are manifests listing several images to mount
+//! together as one tree.  Like images, each manifest is an fs-verity enabled
+//! object, linked here under its digest, and the digest is verified before the
+//! manifest is read.  A set is mounted only through its components' links in
+//! `images/`, and a live set (one named by a ref, or a root the caller of garbage
+//! collection passes; being mounted doesn't count) keeps all of them alive.
+//!
+//! A repository with image sets lists the `image_sets` incompatible feature in
+//! `meta.json` (see [`crate::repository::known_features::IMAGE_SETS`]), so that
+//! versions whose garbage collection doesn't know this directory refuse it.
+//!
 //! ## `streams/`
 //!
 //! This is where [split streams][crate::splitstream] are stored.  As for the images,
@@ -205,7 +222,7 @@
 //! no relation to the original content.  You can, however, store a reference for
 //! it.
 //!
-//! ## `{images,streams}/refs/`
+//! ## `{images,image-sets,streams}/refs/`
 //!
 //! This is where we record which images and streams are currently "requested" by
 //! some external user.  When importing a tar file, in addition to creating the
@@ -213,7 +230,7 @@
 //! directory, we also assign it a name which is chosen by the software which is
 //! performing the import.
 //!
-//! Each ref is a symlink to the top-level entry in `images/` or `streams/`.
+//! Each ref is a symlink to the top-level entry in `images/`, `image-sets/` or `streams/`.
 //!
 //! There are some rough ideas for how we might namespace this.  Something like
 //! this model is imagined:

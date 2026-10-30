@@ -20,7 +20,8 @@ use rustix::{
 
 use crate::{
     mountcompat::{
-        make_erofs_mountable, overlayfs_set_fd, overlayfs_set_lower_and_data_fds, prepare_mount,
+        make_erofs_mountable, overlayfs_check_lowers, overlayfs_set_fd,
+        overlayfs_set_lowers_and_data_fds, prepare_mount,
     },
     util::proc_self_fd,
 };
@@ -290,11 +291,43 @@ pub fn composefs_fsmount(
     verity: VerityRequirement,
     options: &MountOptions,
 ) -> Result<OwnedFd> {
-    let erofs_mnt = erofs_mount(image)?;
-    if let Some(idmap_fd) = &options.idmap_fd {
-        composefs_ioctls::mount::mount_setattr_idmap(erofs_mnt.as_fd(), idmap_fd.as_fd())?;
+    composefs_fsmount_images(vec![image], name, basedirs, verity, options)
+}
+
+/// Creates one composefs mount from several erofs images stacked as overlayfs lower layers.
+///
+/// Like [`composefs_fsmount()`], but every image in `images` becomes a lower layer, the
+/// first one topmost, over the same data layers.  This is how an
+/// [`ImageSet`](crate::image_set::ImageSet) is mounted: `verity` applies to the file
+/// data referenced by every image alike.
+///
+/// On kernels before 6.15 (the `pre-6.15` feature), all layers are passed in a single
+/// `lowerdir` option, which the kernel limits to
+/// [`LOWERDIR_OPTION_MAX`](crate::mountcompat::LOWERDIR_OPTION_MAX) bytes, so only about a
+/// dozen images can be stacked there; more fail with an error naming that limit.
+pub fn composefs_fsmount_images(
+    images: Vec<OwnedFd>,
+    name: &str,
+    basedirs: &[BorrowedFd<'_>],
+    verity: VerityRequirement,
+    options: &MountOptions,
+) -> Result<OwnedFd> {
+    if images.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "composefs mount needs at least one image",
+        ));
     }
-    let erofs_mnt = prepare_mount(erofs_mnt)?;
+    let mut lowers = Vec::with_capacity(images.len());
+    for image in images {
+        let erofs_mnt = erofs_mount(image)?;
+        if let Some(idmap_fd) = &options.idmap_fd {
+            composefs_ioctls::mount::mount_setattr_idmap(erofs_mnt.as_fd(), idmap_fd.as_fd())?;
+        }
+        lowers.push(prepare_mount(erofs_mnt)?);
+    }
+    let lower_fds: Vec<_> = lowers.iter().map(|lower| lower.as_fd()).collect();
+    overlayfs_check_lowers(&lower_fds, basedirs)?;
 
     let mut overlayfs = FsHandle::open("overlay")?;
     fsconfig_set_string(overlayfs.as_fd(), "source", format!("composefs:{name}"))?;
@@ -323,7 +356,7 @@ pub fn composefs_fsmount(
         overlayfs_set_fd(overlayfs.as_fd(), "upperdir", upperdir.as_fd())?;
         overlayfs_set_fd(overlayfs.as_fd(), "workdir", workdir.as_fd())?;
     }
-    overlayfs_set_lower_and_data_fds(&overlayfs, &erofs_mnt, basedirs)?;
+    overlayfs_set_lowers_and_data_fds(&overlayfs, &lower_fds, basedirs)?;
     fsconfig_create(overlayfs.as_fd())?;
 
     let mount_attr = if options.read_write {

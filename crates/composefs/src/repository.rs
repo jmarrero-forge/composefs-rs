@@ -18,6 +18,10 @@
 //! │   ├── 4e67eaccd9fd... → ../objects/4e/67eaccd9fd...
 //! │   └── refs/
 //! │       └── myimage → ../../4e67eaccd9fd...
+//! ├── image-sets/               # Manifests of images mounted together
+//! │   ├── 9a3c... → ../objects/9a/3c...
+//! │   └── refs/
+//! │       └── myset → ../../9a3c...
 //! └── streams/                  # Splitstream storage
 //!     ├── oci-config-sha256:... → ../objects/XX/YYY...
 //!     ├── oci-layer-sha256:... → ../objects/XX/YYY...
@@ -46,8 +50,9 @@
 //!
 //! # References (GC Roots)
 //!
-//! Both `images/refs/` and `streams/refs/` contain named symlinks that serve as
-//! garbage collection roots. Any object reachable from a ref is protected from GC.
+//! `images/refs/`, `image-sets/refs/` and `streams/refs/` contain named symlinks that serve as
+//! garbage collection roots. Any object reachable from a ref is protected from GC; a live
+//! image set keeps every one of its component images alive.
 //! Refs can be organized hierarchically (e.g., `refs/myapp/layer1`).
 //!
 //! See [`Repository::name_stream`] for creating stream refs.
@@ -57,7 +62,7 @@
 //! The repository supports garbage collection via [`Repository::gc()`]. Objects
 //! not reachable from any reference are deleted. The GC algorithm:
 //!
-//! 1. Walks all references in `images/refs/` and `streams/refs/` to find roots
+//! 1. Walks all references in `images/refs/`, `image-sets/refs/` and `streams/refs/` to find roots
 //! 2. Transitively follows stream references to find all reachable objects
 //! 3. Deletes unreferenced objects, images, and streams
 //!
@@ -85,7 +90,7 @@ use std::{
     io::{BufRead, Read, Write},
     os::{
         fd::{AsFd, BorrowedFd, OwnedFd},
-        unix::ffi::OsStrExt,
+        unix::{ffi::OsStrExt, fs::FileExt},
     },
     path::{Path, PathBuf},
     sync::Arc,
@@ -101,20 +106,26 @@ use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
         Access, AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags,
-        StatVfsMountFlags, accessat, flock, fstatvfs, linkat, mkdirat, openat, readlinkat,
-        renameat_with, statat, syncfs, unlinkat,
+        StatVfsMountFlags, accessat, flock, fstatvfs, fsync, linkat, mkdirat, openat, readlinkat,
+        renameat, renameat_with, statat, syncfs, unlinkat,
     },
     io::{Errno, Result as ErrnoResult},
 };
 
 use crate::{
     erofs::format::{FormatConfig, FormatVersion},
+    erofs::reader::DEFAULT_MAX_IMAGE_SIZE,
     fsverity::{
         Algorithm, CompareVerityError, DEFAULT_LG_BLOCKSIZE, EnableVerityError, FsVerityHashValue,
         FsVerityHasher, MeasureVerityError, compute_verity, enable_verity_maybe_copy,
         ensure_verity_equal, has_verity, measure_verity, measure_verity_opt,
     },
-    mount::{MountOptions, VerityRequirement, composefs_fsmount, mount_at},
+    image_set::{
+        COMPONENT_HEADER_SIZE, IMAGE_SET_MAX_SIZE, ImageSet, ImageSetComponent, ROOT_TARGET,
+    },
+    mount::{
+        MountOptions, VerityRequirement, composefs_fsmount, composefs_fsmount_images, mount_at,
+    },
     shared_internals::IO_BUF_CAPACITY,
     splitstream::{SplitStreamReader, SplitStreamWriter},
     util::{ErrnoFilter, generate_tmpname, proc_self_fd, reopen_tmpfile_ro, replace_symlinkat},
@@ -122,6 +133,9 @@ use crate::{
 
 /// The filename used for repository metadata.
 pub const REPO_METADATA_FILENAME: &str = "meta.json";
+
+/// The repository directory holding image sets (see [`crate::image_set`]).
+pub const IMAGE_SETS_DIR: &str = "image-sets";
 
 /// Error marker indicating a named image/ref does not exist in the repository.
 #[derive(Debug, thiserror::Error)]
@@ -227,12 +241,22 @@ pub mod known_features {
     /// image writes into a V1 repo.
     pub const V1_EROFS: &str = "v1_erofs";
 
+    /// The incompatible feature flag for repositories with
+    /// [image sets](crate::image_set), set when the first one is written.
+    ///
+    /// Garbage collection that doesn't know `image-sets/` would delete the
+    /// manifests and every component image only a set keeps alive.  Releases
+    /// before this flag ignore unknown read-only compatible features instead
+    /// of refusing to write (or collect), so only an incompatible one keeps
+    /// them away: they refuse to open the repository at all.
+    pub const IMAGE_SETS: &str = "image_sets";
+
     /// Compatible features understood by this version.
     pub const COMPAT: &[&str] = &[];
     /// Read-only compatible features understood by this version.
     pub const RO_COMPAT: &[&str] = &[V1_EROFS];
     /// Incompatible features understood by this version.
-    pub const INCOMPAT: &[&str] = &[];
+    pub const INCOMPAT: &[&str] = &[IMAGE_SETS];
 }
 
 /// Feature flags for a composefs repository.
@@ -574,36 +598,61 @@ pub(crate) fn read_repo_metadata(repo_fd: &impl AsFd) -> Result<Option<RepoMetad
 
 /// Enable fs-verity on an fd, dispatching to the correct hash type
 /// based on the [`Algorithm`].
+///
+/// Like [`enable_verity_maybe_copy`], this returns a copy of the file with
+/// fs-verity enabled if another process (such as a child forked by another
+/// thread) still had the file open for writing; the original then has no
+/// fs-verity, so the caller must use the copy in its place.  The copy is
+/// synced to disk, as the callers sync the original.
 fn enable_verity_for_algorithm(
     dirfd: &impl AsFd,
     fd: BorrowedFd,
     algorithm: &Algorithm,
-) -> Result<()> {
-    match algorithm {
+) -> Result<Option<OwnedFd>> {
+    let copy = match algorithm {
         Algorithm::Sha256 { .. } => {
             enable_verity_maybe_copy::<crate::fsverity::Sha256HashValue>(dirfd, fd)
-                .context("enabling verity (sha256)")?;
+                .context("enabling verity (sha256)")?
         }
         Algorithm::Sha512 { .. } => {
             enable_verity_maybe_copy::<crate::fsverity::Sha512HashValue>(dirfd, fd)
-                .context("enabling verity (sha512)")?;
+                .context("enabling verity (sha512)")?
         }
+    };
+    if let Some(copy) = &copy {
+        debug!("enabled fs-verity on a copy, as the file was open for writing elsewhere");
+        fsync(copy).context("syncing the fs-verity copy")?;
     }
-    Ok(())
+    Ok(copy)
+}
+
+/// Replaces the file `name` in `dirfd` with `copy`, the copy with fs-verity
+/// enabled that [`enable_verity_for_algorithm`] returned for it.
+fn link_verity_copy(dirfd: &impl AsFd, name: &str, copy: &OwnedFd) -> Result<()> {
+    unlinkat(dirfd, name, AtFlags::empty())
+        .with_context(|| format!("removing {name} without fs-verity"))?;
+    linkat(
+        CWD,
+        proc_self_fd(copy),
+        dirfd,
+        name,
+        AtFlags::SYMLINK_FOLLOW,
+    )
+    .with_context(|| format!("linking the fs-verity copy of {name}"))
 }
 
 /// Remove algorithm-specific data from a repository directory.
 ///
-/// Deletes `streams/`, `images/`, and `meta.json` but preserves
+/// Deletes `streams/`, `images/`, `image-sets/` and `meta.json` but preserves
 /// `objects/` (content-addressed blobs that are algorithm-agnostic).
 /// This prepares the repository for re-initialization with a
 /// (potentially different) algorithm via [`Repository::init_path`].
 ///
-/// After calling this, streams and images will need to be re-imported.
+/// After calling this, streams, images and image sets will need to be re-imported.
 #[context("Resetting repository metadata at {}", path.as_ref().display())]
 pub fn reset_metadata(path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
-    for dir in ["streams", "images"] {
+    for dir in ["streams", "images", IMAGE_SETS_DIR] {
         let p = path.join(dir);
         if p.exists() {
             std::fs::remove_dir_all(&p).with_context(|| format!("removing {}", p.display()))?;
@@ -667,11 +716,14 @@ pub(crate) fn write_repo_metadata(
                 .context("writing metadata to tmpfile")?;
             file.sync_all().context("syncing metadata tmpfile")?;
 
-            let ro_fd = reopen_tmpfile_ro(file).context("re-opening tmpfile read-only")?;
+            let mut ro_fd = reopen_tmpfile_ro(file).context("re-opening tmpfile read-only")?;
 
-            if enable_verity {
-                enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
-                    .context("enabling verity on meta.json")?;
+            if enable_verity
+                && let Some(copy) =
+                    enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
+                        .context("enabling verity on meta.json")?
+            {
+                ro_fd = copy;
             }
 
             linkat(
@@ -707,8 +759,12 @@ pub(crate) fn write_repo_metadata(
                 )
                 .context("re-opening meta.json for verity")?;
                 drop(file);
-                enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
-                    .context("enabling verity on meta.json")?;
+                if let Some(copy) =
+                    enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
+                        .context("enabling verity on meta.json")?
+                {
+                    link_verity_copy(repo_fd, REPO_METADATA_FILENAME, &copy)?;
+                }
             }
         }
         Err(e) => {
@@ -716,6 +772,52 @@ pub(crate) fn write_repo_metadata(
         }
     }
     Ok(())
+}
+
+/// Atomically replaces `meta.json` with `meta`, through a temporary file
+/// renamed over it, with fs-verity enabled on the new file if `enable_verity`.
+#[context("Replacing repository metadata")]
+fn replace_repo_metadata(
+    repo_fd: &OwnedFd,
+    meta: &RepoMetadata,
+    enable_verity: bool,
+) -> Result<()> {
+    let data = meta.to_json()?;
+    let tmpname = generate_tmpname(".meta.json.");
+    let write = || -> Result<()> {
+        let fd = openat(
+            repo_fd,
+            &tmpname,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )
+        .context("creating temporary meta.json")?;
+        let mut file = File::from(fd);
+        file.write_all(&data)
+            .context("writing temporary meta.json")?;
+        file.sync_all().context("syncing temporary meta.json")?;
+        drop(file);
+        if enable_verity {
+            let ro_fd = openat(
+                repo_fd,
+                &tmpname,
+                OFlags::RDONLY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .context("re-opening temporary meta.json for verity")?;
+            if let Some(copy) = enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
+                .context("enabling verity on meta.json")?
+            {
+                link_verity_copy(repo_fd, &tmpname, &copy)?;
+            }
+        }
+        renameat(repo_fd, &tmpname, repo_fd, REPO_METADATA_FILENAME)
+            .context("renaming temporary meta.json into place")?;
+        Ok(())
+    };
+    write().inspect_err(|_| {
+        let _ = unlinkat(repo_fd, &tmpname, AtFlags::empty());
+    })
 }
 
 /// Infer repository metadata by examining existing objects.
@@ -1093,6 +1195,8 @@ pub struct GcResult {
     pub images_pruned: u64,
     /// Number of broken symlinks removed in streams/
     pub streams_pruned: u64,
+    /// Number of broken symlinks removed in image-sets/
+    pub image_sets_pruned: u64,
 }
 
 /// A structured error found during a filesystem consistency check.
@@ -1172,6 +1276,16 @@ pub enum FsckError {
     #[serde(rename_all = "camelCase")]
     ImageMissingObject { path: String, object_id: String },
 
+    #[error("fsck: image-set-invalid: {path}: {detail}")]
+    ImageSetInvalid { path: String, detail: String },
+
+    #[error("fsck: image-set-component-invalid: {path}: {image}: {detail}")]
+    ImageSetComponentInvalid {
+        path: String,
+        image: String,
+        detail: String,
+    },
+
     #[error("fsck: metadata-parse-failed: meta.json: {detail}")]
     MetadataParseFailed { detail: String },
 
@@ -1201,6 +1315,10 @@ pub struct FsckResult {
     pub images_checked: u64,
     /// Number of images with issues.
     pub images_corrupted: u64,
+    /// Number of image sets verified.
+    pub image_sets_checked: u64,
+    /// Number of image sets with issues (a bad manifest, or a bad or missing component).
+    pub image_sets_corrupted: u64,
     /// Number of broken symlinks found.
     pub broken_links: u64,
     /// Number of missing objects referenced by streams.
@@ -1221,6 +1339,7 @@ impl FsckResult {
             self.objects_corrupted == 0
                 && self.streams_corrupted == 0
                 && self.images_corrupted == 0
+                && self.image_sets_corrupted == 0
                 && self.broken_links == 0
                 && self.missing_objects == 0
                 || !self.errors.is_empty(),
@@ -1257,6 +1376,16 @@ impl FsckResult {
     /// Number of images with issues.
     pub fn images_corrupted(&self) -> u64 {
         self.images_corrupted
+    }
+
+    /// Number of image sets verified.
+    pub fn image_sets_checked(&self) -> u64 {
+        self.image_sets_checked
+    }
+
+    /// Number of image sets with issues.
+    pub fn image_sets_corrupted(&self) -> u64 {
+        self.image_sets_corrupted
     }
 
     /// Number of broken symlinks found.
@@ -1308,6 +1437,15 @@ impl fmt::Display for FsckResult {
             self.images_checked.saturating_sub(self.images_corrupted),
             self.images_checked
         )?;
+        if self.image_sets_checked > 0 {
+            writeln!(
+                f,
+                "image sets: {}/{} ok",
+                self.image_sets_checked
+                    .saturating_sub(self.image_sets_corrupted),
+                self.image_sets_checked
+            )?;
+        }
         if self.broken_links > 0 {
             writeln!(f, "broken symlinks: {}", self.broken_links)?;
         }
@@ -2815,31 +2953,47 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
     /// Returns the fd of the image and whether or not verity should be
     /// enabled when mounting it.
+    ///
+    /// `name` is the image's digest, which is checked against the image's
+    /// fs-verity digest, or the name of a ref (`refs/<name>`, or `<name>`
+    /// when no image has that digest), which is trusted as it is.
     #[context("Opening image '{name}'")]
     pub fn open_image(&self, name: &str) -> Result<(OwnedFd, bool)> {
-        let image = match self.openat(&format!("images/{name}"), OFlags::RDONLY) {
+        self.open_verified_entry("images", name)
+    }
+
+    /// Opens `<category>/<name>` (or the ref `<category>/refs/<name>`) for
+    /// [`Self::open_image`] and [`Self::open_image_set`].
+    ///
+    /// A `name` that is a digest is checked against the file's fs-verity
+    /// digest, whichever of the two paths it was found under: a ref named
+    /// like a digest must not stand in for the entry of that digest.  Any
+    /// other name is a ref, trusted as it is.  Returns whether fs-verity is
+    /// to be required when mounting: false only in an insecure repository,
+    /// for an entry without fs-verity.
+    fn open_verified_entry(&self, category: &str, name: &str) -> Result<(OwnedFd, bool)> {
+        let not_found = || {
+            anyhow::Error::new(ImageNotFound {
+                name: name.to_string(),
+            })
+        };
+        let image = match self.openat(&format!("{category}/{name}"), OFlags::RDONLY) {
             Ok(fd) => fd,
             Err(Errno::NOENT) if !name.contains('/') => {
                 // Try resolving as a named ref before giving up
-                match self.openat(&format!("images/refs/{name}"), OFlags::RDONLY) {
+                match self.openat(&format!("{category}/refs/{name}"), OFlags::RDONLY) {
+                    Ok(fd) if ObjectID::from_hex(name).is_ok() => fd,
                     Ok(fd) => return Ok((fd, true)),
-                    Err(Errno::NOENT) => {
-                        return Err(anyhow::Error::new(ImageNotFound {
-                            name: name.to_string(),
-                        }));
-                    }
+                    Err(Errno::NOENT) => return Err(not_found()),
                     Err(e) => {
-                        return Err(e).with_context(|| format!("Opening ref 'images/refs/{name}'"));
+                        return Err(e)
+                            .with_context(|| format!("Opening ref '{category}/refs/{name}'"));
                     }
                 }
             }
-            Err(Errno::NOENT) => {
-                return Err(anyhow::Error::new(ImageNotFound {
-                    name: name.to_string(),
-                }));
-            }
+            Err(Errno::NOENT) => return Err(not_found()),
             Err(e) => {
-                return Err(e).with_context(|| format!("Opening ref 'images/{name}'"));
+                return Err(e).with_context(|| format!("Opening ref '{category}/{name}'"));
             }
         };
 
@@ -2905,6 +3059,247 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             &canonicalize(mountpoint).context("Canonicalizing mountpoint path")?,
         )
         .context("Attaching mount at target path")
+    }
+
+    /// Writes `set` into the repository as an image set, with the optional named ref `name`.
+    ///
+    /// Every component must already be an image in this repository, in the format
+    /// the component declares, and contain nothing outside its target but its
+    /// ancestors (see [`crate::image_set`]).  Returns the fs-verity digest of the
+    /// manifest, which names the set for [`Self::open_image_set`] and
+    /// [`Self::mount_image_set`], and keeps the set and all its components alive as
+    /// a GC root while `name` exists.
+    ///
+    /// The first set written adds the [`known_features::IMAGE_SETS`]
+    /// incompatible feature to `meta.json`, so that older versions don't collect
+    /// what only sets keep alive.  It is added once the components have been
+    /// checked, so that a set that is refused doesn't lock older versions out.
+    /// They check it when they open the repository, so one that already has it
+    /// open misses it: the feature is added under the exclusive lock when that
+    /// can be had without waiting, which keeps out handles holding the shared
+    /// lock, and otherwise (another handle in this process counts too) under the
+    /// shared one.
+    ///
+    /// # Integrity
+    ///
+    /// This function is not safe for untrusted users.
+    #[context("Writing image set to repository")]
+    pub fn write_image_set(
+        &self,
+        name: Option<&str>,
+        set: &ImageSet<ObjectID>,
+    ) -> Result<ObjectID> {
+        let writable = self.ensure_writable_token()?;
+        let check_components = || -> Result<()> {
+            for component in set.components() {
+                let hex = component.digest.to_hex();
+                self.open_image_set_component(component)
+                    .with_context(|| format!("Checking component image {hex}"))?;
+            }
+            Ok(())
+        };
+        check_components()?;
+        // Adding the feature lets go of the lock for a moment, so a GC may
+        // have removed a component meanwhile: check them again.
+        if self.ensure_incompatible_feature(known_features::IMAGE_SETS, &writable)? {
+            check_components()?;
+        }
+
+        let object_id = self.ensure_object_impl(&set.to_bytes(), &writable)?;
+        let object_path = Self::format_object_path(&object_id);
+        let set_path = format!("{IMAGE_SETS_DIR}/{}", object_id.to_hex());
+        self.symlink_impl(&set_path, &object_path, &writable)?;
+
+        if let Some(reference) = name {
+            let ref_path = format!("{IMAGE_SETS_DIR}/refs/{reference}");
+            self.symlink_impl(&ref_path, &set_path, &writable)?;
+        }
+
+        Ok(object_id)
+    }
+
+    /// Adds the incompatible feature `feature` to `meta.json`, unless it is already there.
+    ///
+    /// This takes the exclusive repository lock if it can without waiting, so that
+    /// no other metadata writer races with it and handles that are only holding
+    /// the shared lock are kept out.  That doesn't prove no other handle is open,
+    /// though: one waiting to convert its shared lock to the exclusive one, as an
+    /// older composefs-rs's GC does, holds no lock meanwhile, and once it has it,
+    /// collects without knowing the feature.  With another handle holding the
+    /// shared lock, waiting could deadlock (a handle in this same process
+    /// conflicts too, which is what bootc always has), so the feature is then
+    /// added under the shared lock, and a process that already had the repository
+    /// open doesn't see it until it reopens.  An older version can only be stopped
+    /// when it opens the repository, so that gap can't be closed from here.
+    ///
+    /// Either way the lock is let go of for a moment (flock conversions aren't atomic),
+    /// so a GC may run in between: check anything unreferenced after this.  Returns
+    /// whether that happened, that is, whether the feature wasn't there yet.
+    #[context("Adding incompatible repository feature {feature}")]
+    fn ensure_incompatible_feature(&self, feature: &str, _writable: &WritableRepo) -> Result<bool> {
+        let has_feature =
+            |meta: &RepoMetadata| meta.features.incompatible.iter().any(|f| f == feature);
+        // Re-read meta.json rather than trust self.metadata: another process
+        // may have added the feature since this repository was opened.
+        if has_feature(&Self::read_and_probe_metadata(&self.repository)?.0) {
+            return Ok(false);
+        }
+        let exclusive = match flock(&self.repository, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => true,
+            Err(Errno::WOULDBLOCK) => {
+                // The failed conversion dropped the shared lock: take it back.
+                flock(&self.repository, FlockOperation::LockShared)
+                    .context("Retaking shared repository lock")?;
+                log::info!(
+                    "Adding repository feature {feature} under the shared lock: \
+                     the repository is open elsewhere"
+                );
+                false
+            }
+            Err(e) => return Err(e).context("Taking exclusive repository lock"),
+        };
+        let result = (|| {
+            let (mut meta, has_verity) = Self::read_and_probe_metadata(&self.repository)?;
+            if has_feature(&meta) {
+                return Ok(());
+            }
+            meta.features.incompatible.push(feature.to_string());
+            replace_repo_metadata(&self.repository, &meta, has_verity)
+        })();
+        if exclusive {
+            flock(&self.repository, FlockOperation::LockShared)
+                .context("Downgrading to shared repository lock")?;
+        }
+        result.map(|()| true)
+    }
+
+    /// Opens the image set `name` (its digest, or a ref) and parses its manifest.
+    ///
+    /// For a digest, the manifest's fs-verity digest is measured and compared with
+    /// it, as [`Self::open_image`] does for images, whether `name` was found as a
+    /// digest or as a ref, and the manifest is read through that same file
+    /// descriptor, so what is parsed is what the digest pins.  A ref name is trusted
+    /// as it is.  Returns the set and whether fs-verity is to be required when
+    /// mounting it: false only in an insecure repository whose manifest lacks
+    /// fs-verity.  A missing set is an [`ImageNotFound`] error.
+    #[context("Opening image set '{name}'")]
+    pub fn open_image_set(&self, name: &str) -> Result<(ImageSet<ObjectID>, bool)> {
+        let (data, verified) = self.read_image_set_manifest(name)?;
+        Ok((ImageSet::parse(&data)?, verified))
+    }
+
+    /// The bytes of the manifest of the image set `name`, opened like
+    /// [`Self::open_image_set`] does, without parsing them.
+    fn read_image_set_manifest(&self, name: &str) -> Result<(Vec<u8>, bool)> {
+        let (fd, verified) = self.open_verified_entry(IMAGE_SETS_DIR, name)?;
+        let mut data = Vec::new();
+        File::from(fd)
+            .take(IMAGE_SET_MAX_SIZE as u64 + 1)
+            .read_to_end(&mut data)
+            .context("Reading image set manifest")?;
+        Ok((data, verified))
+    }
+
+    /// Opens the image of `component` with [`Self::open_image`] and checks it
+    /// against the component with [`ImageSetComponent::check_format`] and
+    /// [`ImageSetComponent::check_contents`].  Only the header of the root
+    /// component's image is read, and all of the others'.
+    fn open_image_set_component(
+        &self,
+        component: &ImageSetComponent<ObjectID>,
+    ) -> Result<(OwnedFd, bool)> {
+        let hex = component.digest.to_hex();
+        let (image, verified) = self.open_image(&hex)?;
+        let file = File::from(image.try_clone().context("Duplicating image fd")?);
+        let len = if component.target == ROOT_TARGET {
+            COMPONENT_HEADER_SIZE as u64
+        } else {
+            file.metadata().context("Measuring image")?.len()
+        };
+        ensure!(
+            len <= DEFAULT_MAX_IMAGE_SIZE as u64,
+            "image {hex} is {len} bytes, more than the limit of {DEFAULT_MAX_IMAGE_SIZE}"
+        );
+        let mut data = vec![0; len as usize];
+        file.read_exact_at(&mut data, 0)
+            .with_context(|| format!("Reading image {hex}"))?;
+        component.check_format(&data)?;
+        component.check_contents(&data)?;
+        Ok((image, verified))
+    }
+
+    /// Lists the named image set references under `prefix`, like
+    /// [`Self::list_image_refs`] does for images.
+    pub fn list_image_set_refs(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        self.list_refs_in(&format!("{IMAGE_SETS_DIR}/refs/{prefix}"))
+    }
+
+    /// Removes the image set reference `name`, as written by
+    /// [`Self::write_image_set`], so that it no longer keeps its set alive.
+    /// Removing a reference that doesn't exist does nothing.
+    #[context("Removing image set ref '{name}'")]
+    pub fn remove_image_set_ref(&self, name: &str) -> Result<()> {
+        self.ensure_writable_token()?;
+        unlinkat(
+            &self.repository,
+            format!("{IMAGE_SETS_DIR}/refs/{name}"),
+            AtFlags::empty(),
+        )
+        .filter_errno(Errno::NOENT)?;
+        Ok(())
+    }
+
+    /// Create a detached mount of an image set: all its component images
+    /// stacked as overlayfs lower layers over the object store.
+    ///
+    /// The manifest and every component image are verified like
+    /// [`Self::open_image`] does, and each component image is checked against
+    /// its component like [`Self::write_image_set`] does.  File data is mounted
+    /// with `verity=require` unless the repository is insecure and one of them
+    /// lacks fs-verity.  The mount source is `composefs:<name>`.
+    ///
+    /// The mount doesn't keep the set alive through [`Self::gc`]: keep a ref
+    /// to it for as long as it is in use (see there).
+    #[context("Mounting image set '{name}'")]
+    pub fn mount_image_set_with_options(
+        &self,
+        name: &str,
+        options: &MountOptions,
+    ) -> Result<OwnedFd> {
+        let (set, mut enable_verity) = self.open_image_set(name)?;
+        let mut images = Vec::with_capacity(set.components().len());
+        for component in set.components() {
+            let hex = component.digest.to_hex();
+            // A missing component means a broken set, not a missing one:
+            // don't let callers mistake it for ImageNotFound.
+            let (image, image_verity) =
+                self.open_image_set_component(component).map_err(|err| {
+                    if err.downcast_ref::<ImageNotFound>().is_some() {
+                        anyhow::anyhow!("Component image {hex} of image set {name} is missing")
+                    } else {
+                        err.context(format!("Opening component image {hex}"))
+                    }
+                })?;
+            enable_verity &= image_verity;
+            images.push(image);
+        }
+        let objects = self
+            .objects_dir()
+            .context("Getting objects directory for mount")?;
+        let verity = if enable_verity {
+            VerityRequirement::Required
+        } else {
+            VerityRequirement::Disabled
+        };
+
+        composefs_fsmount_images(images, name, &[objects.as_fd()], verity, options)
+            .context("Creating filesystem mount")
+    }
+
+    /// Create a detached read-only mount of an image set.  See
+    /// [`Self::mount_image_set_with_options`].
+    pub fn mount_image_set(&self, name: &str) -> Result<OwnedFd> {
+        self.mount_image_set_with_options(name, &MountOptions::default())
     }
 
     /// Creates a relative symlink within the repository.
@@ -3265,10 +3660,32 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .context("Spawning blocking sync task")?
     }
 
+    /// The digests of the component images of the live image set `name`, for
+    /// GC, or why GC can't tell them.
+    fn gc_image_set_components(&self, name: &str) -> Result<Vec<String>> {
+        let (data, _) = self.read_image_set_manifest(name)?;
+        let set = ImageSet::<ObjectID>::parse(&data)?;
+        Ok(set
+            .components()
+            .iter()
+            .map(|component| component.digest.to_hex())
+            .collect())
+    }
+
     /// Perform garbage collection, removing unreferenced objects.
     ///
-    /// Objects reachable from `images/refs/` or `streams/refs/` are preserved,
-    /// plus any `additional_roots` (looked up in both images and streams).
+    /// Objects reachable from `images/refs/`, `image-sets/refs/` or `streams/refs/` are
+    /// preserved, plus any `additional_roots` (looked up in images, image sets and streams)
+    /// and mounted images.  A live image set keeps its manifest and all its component
+    /// images; one whose manifest can't be read or parsed (say, of a newer format) keeps
+    /// every image in the repository, since there's no telling which it needs.
+    ///
+    /// Only a ref or an additional root keeps an image set alive, not a mount.  A mounted
+    /// set's component images are kept like any mounted image while their lock is held,
+    /// which is not always the case (where the kernel doesn't take the image as an fd
+    /// source, see [`crate::mount::erofs_mount`], a booted system holds no lock), and
+    /// nothing keeps its manifest.  So whoever boots or mounts a set has to keep a ref to
+    /// it, as bootc does for each deployment.
     /// Returns statistics about what was removed.
     ///
     /// # Locking
@@ -3305,10 +3722,43 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let mut result = GcResult::default();
         let mut live_objects = HashSet::new();
 
-        // Build set of additional roots (checked in both images and streams)
+        // Build set of additional roots (checked in images, image sets and streams)
         let extra_roots: HashSet<_> = additional_roots.iter().map(|s| s.to_string()).collect();
 
-        // Collect images: those in images/refs plus caller-specified roots
+        // Collect image sets: those in image-sets/refs and caller-specified
+        // roots.  A live set keeps its manifest and every component image.
+        let ref_sets: HashSet<_> = self
+            .gc_category(IMAGE_SETS_DIR, GCCategoryWalkMode::RefsOnly)
+            .context("Collecting image set refs")?
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        let mut set_components = HashSet::new();
+        let mut keep_all_images = false;
+        for (id, name) in self
+            .gc_category(IMAGE_SETS_DIR, GCCategoryWalkMode::AllEntries)
+            .context("Collecting all image sets")?
+        {
+            if !(ref_sets.contains(&name) || extra_roots.contains(&name)) {
+                continue;
+            }
+            trace!("{name} lives as an image set");
+            live_objects.insert(id);
+            match self.gc_image_set_components(&name) {
+                Ok(components) => set_components.extend(components),
+                Err(err) => {
+                    // Without its components there's no telling which images
+                    // it needs, so keep them all rather than fail the whole GC.
+                    log::warn!(
+                        "Keeping all images: can't tell which ones live image set {name} uses: {err:#}"
+                    );
+                    keep_all_images = true;
+                }
+            }
+        }
+
+        // Collect images: those in images/refs, caller-specified roots and
+        // the components of live image sets
         let all_images = self
             .gc_category("images", GCCategoryWalkMode::AllEntries)
             .context("Collecting all images")?;
@@ -3319,7 +3769,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .chain(
                 all_images
                     .iter()
-                    .filter(|(_, name)| extra_roots.contains(name))
+                    .filter(|(_, name)| {
+                        keep_all_images
+                            || extra_roots.contains(name)
+                            || set_components.contains(name)
+                    })
                     .cloned(),
             )
             .collect();
@@ -3483,6 +3937,9 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         result.streams_pruned = self
             .cleanup_gc_category("streams", dry_run)
             .context("Cleaning up broken stream symlinks")?;
+        result.image_sets_pruned = self
+            .cleanup_gc_category(IMAGE_SETS_DIR, dry_run)
+            .context("Cleaning up broken image set symlinks")?;
 
         // Downgrade to shared lock if we had exclusive (for actual GC)
         if !dry_run {
@@ -3549,6 +4006,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         // Phase 3: Verify image symlinks
         self.fsck_category("images", &mut result)
             .context("Checking images")?;
+
+        // Phase 4: Verify image set symlinks, manifests and components
+        self.fsck_category(IMAGE_SETS_DIR, &mut result)
+            .context("Checking image sets")?;
 
         Ok(result)
     }
@@ -3638,12 +4099,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(())
     }
 
-    /// Verify symlink integrity and splitstream/image validity for a category
-    /// ("streams" or "images").
+    /// Verify symlink integrity and splitstream/image/image set validity for a
+    /// category ("streams", "images" or "image-sets").
     #[context("Checking {category} integrity")]
     fn fsck_category(&self, category: &str, result: &mut FsckResult) -> Result<()> {
-        let is_streams = category == "streams";
-
         let Some(category_fd) = self
             .openat(
                 category,
@@ -3665,18 +4124,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 continue;
             }
 
-            if is_streams {
-                result.streams_checked += 1;
-            } else {
-                result.images_checked += 1;
-            }
+            Self::fsck_count(result, category, false);
 
             if entry.file_type() != FileType::Symlink {
-                if is_streams {
-                    result.streams_corrupted += 1;
-                } else {
-                    result.images_corrupted += 1;
-                }
+                Self::fsck_count(result, category, true);
                 result.errors.push(FsckError::EntryNotSymlink {
                     path: format!(
                         "{category}/{}",
@@ -3691,11 +4142,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 Ok(_) => {}
                 Err(Errno::NOENT) => {
                     result.broken_links += 1;
-                    if is_streams {
-                        result.streams_corrupted += 1;
-                    } else {
-                        result.images_corrupted += 1;
-                    }
+                    Self::fsck_count(result, category, true);
                     result.errors.push(FsckError::BrokenSymlink {
                         path: format!(
                             "{category}/{}",
@@ -3717,12 +4164,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             }
 
             let name = String::from_utf8_lossy(filename.to_bytes()).to_string();
-            if is_streams {
+            match category {
                 // Validate splitstream contents
-                self.fsck_splitstream(&name, result);
-            } else {
+                "streams" => self.fsck_splitstream(&name, result),
+                // Validate the manifest and every component
+                IMAGE_SETS_DIR => self.fsck_image_set(&name, result),
                 // Validate erofs image structure and object references
-                self.fsck_image(&name, result);
+                _ => self.fsck_image(&name, result),
             }
         }
 
@@ -3813,6 +4261,51 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             }
         }
         Ok(())
+    }
+
+    /// Counts one more checked, or corrupted, entry of `category` in `result`.
+    fn fsck_count(result: &mut FsckResult, category: &str, corrupted: bool) {
+        let (checked, bad) = match category {
+            "streams" => (&mut result.streams_checked, &mut result.streams_corrupted),
+            IMAGE_SETS_DIR => (
+                &mut result.image_sets_checked,
+                &mut result.image_sets_corrupted,
+            ),
+            _ => (&mut result.images_checked, &mut result.images_corrupted),
+        };
+        *if corrupted { bad } else { checked } += 1;
+    }
+
+    /// Validate a single image set: its manifest must match its digest and
+    /// parse, and every component must be an image of this repository that
+    /// matches the component.
+    fn fsck_image_set(&self, name: &str, result: &mut FsckResult) {
+        let path = format!("{IMAGE_SETS_DIR}/{name}");
+        let set = match self.open_image_set(name) {
+            Ok((set, _)) => set,
+            Err(e) => {
+                result.image_sets_corrupted += 1;
+                result.errors.push(FsckError::ImageSetInvalid {
+                    path,
+                    detail: format!("{e:#}"),
+                });
+                return;
+            }
+        };
+        let mut corrupted = false;
+        for component in set.components() {
+            if let Err(e) = self.open_image_set_component(component) {
+                corrupted = true;
+                result.errors.push(FsckError::ImageSetComponentInvalid {
+                    path: path.clone(),
+                    image: component.digest.to_hex(),
+                    detail: format!("{e:#}"),
+                });
+            }
+        }
+        if corrupted {
+            result.image_sets_corrupted += 1;
+        }
     }
 
     /// Validate a single splitstream: check header and object references.
@@ -4918,6 +5411,593 @@ mod tests {
         assert!(result.objects_bytes > 0);
         assert_eq!(result.images_pruned, 0);
         assert_eq!(result.streams_pruned, 0);
+        Ok(())
+    }
+
+    /// A filesystem with one file at `path` (relative, with its parent
+    /// directories) referring to `obj`.
+    fn make_test_fs_at(
+        path: &str,
+        obj: &Sha512HashValue,
+        size: u64,
+    ) -> FileSystem<Sha512HashValue> {
+        let mut fs: FileSystem<Sha512HashValue> = FileSystem::new(test_root_stat());
+        let mut dir = String::new();
+        for name in Path::new(path).parent().unwrap().iter() {
+            dir = format!("{dir}{}/", name.to_str().unwrap());
+            let (parent, name) = fs
+                .root
+                .split_mut(OsStr::new(dir.trim_end_matches('/')))
+                .unwrap();
+            parent.insert(
+                name,
+                Inode::Directory(Box::new(crate::tree::Directory::new(test_root_stat()))),
+            );
+        }
+        let leaf_id = fs.push_leaf(
+            Stat {
+                st_mode: 0o644,
+                st_uid: 0,
+                st_gid: 0,
+                st_mtim_sec: 0,
+                st_mtim_nsec: 0,
+                xattrs: Default::default(),
+            },
+            LeafContent::Regular(RegularFile::External(obj.clone(), size)),
+        );
+        let (parent, name) = fs.root.split_mut(OsStr::new(path)).unwrap();
+        parent.insert(name, Inode::leaf(leaf_id));
+        fs
+    }
+
+    const TEST_OBJECT_SIZE: u64 = 32 * 1024;
+
+    /// An image in `repo` with one file at `path` referring to a new object
+    /// of its own.  Returns (image, object).
+    fn make_image_at(
+        repo: &Repository<Sha512HashValue>,
+        path: &str,
+        seed: u8,
+    ) -> Result<(Sha512HashValue, Sha512HashValue)> {
+        let object = repo.ensure_object(&generate_test_data(TEST_OBJECT_SIZE, seed))?;
+        let image = make_test_fs_at(path, &object, TEST_OBJECT_SIZE).commit_image(repo, None)?;
+        Ok((image, object))
+    }
+
+    /// A root image and a `/usr/lib/modules` image in `repo`, each referring
+    /// to one object of its own, plus an unreferenced object.  Returns
+    /// (images, image objects, unreferenced object).
+    fn make_two_images(
+        repo: &Repository<Sha512HashValue>,
+    ) -> Result<([Sha512HashValue; 2], [Sha512HashValue; 2], Sha512HashValue)> {
+        let (root, root_object) = make_image_at(repo, "data", 0x11)?;
+        let (modules, modules_object) = make_image_at(repo, "usr/lib/modules/data", 0x22)?;
+        let unreferenced = repo.ensure_object(&generate_test_data(TEST_OBJECT_SIZE, 0x33))?;
+        Ok(([root, modules], [root_object, modules_object], unreferenced))
+    }
+
+    fn image_set_of(images: &[Sha512HashValue]) -> ImageSet<Sha512HashValue> {
+        let targets = ["/", "/usr/lib/modules"];
+        ImageSet::new(
+            images
+                .iter()
+                .zip(targets)
+                .map(|(digest, target)| ImageSetComponent {
+                    digest: digest.clone(),
+                    format: FormatVersion::V1,
+                    target: target.into(),
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    /// Create a test repository that requires fs-verity, which the test
+    /// directory must support (as in composefs-rs CI).
+    fn create_strict_test_repo(path: &Path) -> Result<Arc<Repository<Sha512HashValue>>> {
+        let (repo, _) = Repository::init_path(CWD, path, RepositoryConfig::new(Algorithm::SHA512))
+            .context("a strict test repository needs fs-verity in $CFS_TEST_TMPDIR")?;
+        assert!(!repo.is_insecure());
+        Ok(Arc::new(repo))
+    }
+
+    /// Replaces the repository's `link` with a symlink to `target`, both
+    /// relative to the repository.
+    fn relink(
+        tmp: &TempDir,
+        repo: &Repository<Sha512HashValue>,
+        link: &str,
+        target: &str,
+    ) -> Result<()> {
+        std::fs::remove_file(tmp.path().join("repo").join(link)).or_else(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })?;
+        repo.symlink(link, target)
+    }
+
+    #[test]
+    fn test_image_set_write_and_open() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        let (images, _, _) = make_two_images(&repo)?;
+        let set = image_set_of(&images);
+
+        let id = repo.write_image_set(Some("myset"), &set)?;
+        assert_eq!(id, set.compute_id());
+        let set_path = format!("{IMAGE_SETS_DIR}/{}", id.to_hex());
+        assert!(test_path_exists_in_repo(&tmp, &set_path)?);
+        assert!(test_object_exists(&tmp, &id)?);
+
+        // By digest and by ref
+        for name in [id.to_hex().as_str(), "myset"] {
+            let (opened, _) = repo.open_image_set(name)?;
+            assert_eq!(opened, set, "{name}");
+        }
+
+        // Writing the same set again is idempotent
+        assert_eq!(repo.write_image_set(None, &set)?, id);
+
+        // Unknown sets are ImageNotFound, like images
+        let missing = Sha512HashValue::from_hex("ab".repeat(64))?;
+        for name in [missing.to_hex().as_str(), "nosuchref"] {
+            let err = repo.open_image_set(name).unwrap_err();
+            assert!(err.downcast_ref::<ImageNotFound>().is_some(), "{err:#}");
+        }
+
+        // An image set's digest is not an image, and vice versa
+        assert!(repo.open_image(&id.to_hex()).is_err());
+        assert!(repo.open_image_set(&images[0].to_hex()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_image_set_sets_incompatible_feature() -> Result<()> {
+        let tmp = tempdir();
+        let repo_path = tmp.path().join("repo");
+        let repo = create_test_repo(&repo_path)?;
+        let (images, _, _) = make_two_images(&repo)?;
+        let read_features = || -> Result<FeatureFlags> {
+            Ok(read_repo_metadata(&repo.repository)?.unwrap().features)
+        };
+        assert!(read_features()?.incompatible.is_empty());
+
+        repo.write_image_set(None, &image_set_of(&images))?;
+        repo.write_image_set(None, &image_set_of(&images[..1]))?;
+        let features = read_features()?;
+        assert_eq!(features.incompatible, [known_features::IMAGE_SETS]);
+        assert_eq!(features.check()?, FeatureCheck::ReadWrite);
+        // This version reopens it...
+        drop(repo);
+        Repository::<Sha512HashValue>::open_path(CWD, &repo_path)?;
+        // ...but one that doesn't know image sets finds an unknown
+        // incompatible feature, and refuses it.
+        let older_known: &[&str] = &[];
+        let unknown: Vec<_> = features
+            .incompatible
+            .iter()
+            .filter(|f| !older_known.contains(&f.as_str()))
+            .collect();
+        assert_eq!(unknown, [known_features::IMAGE_SETS]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_image_set_feature_with_other_handles() -> Result<()> {
+        // Adding the feature takes the exclusive lock only when nothing else has
+        // the repository open; with another handle (here, in this same process)
+        // it must not wait for it.  Either way the writer keeps its shared lock.
+        for other_handle in [false, true] {
+            let tmp = tempdir();
+            let repo_path = tmp.path().join("repo");
+            let repo = create_test_repo(&repo_path)?;
+            let (images, _, _) = make_two_images(&repo)?;
+            let other = other_handle
+                .then(|| Repository::<Sha512HashValue>::open_path(CWD, &repo_path))
+                .transpose()?;
+
+            repo.write_image_set(None, &image_set_of(&images))?;
+
+            let features = read_repo_metadata(&repo.repository)?.unwrap().features;
+            assert_eq!(features.incompatible, [known_features::IMAGE_SETS]);
+            drop(other);
+            let lock = std::fs::File::open(&repo_path)?;
+            assert_eq!(
+                flock(&lock, FlockOperation::NonBlockingLockExclusive),
+                Err(Errno::WOULDBLOCK),
+                "other handle {other_handle}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_image_set_requires_existing_components() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        let (images, _, _) = make_two_images(&repo)?;
+        let missing = Sha512HashValue::from_hex("ab".repeat(64))?;
+        let set = image_set_of(&[images[0].clone(), missing.clone()]);
+
+        let err = repo.write_image_set(Some("broken"), &set).unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&format!("Checking component image {}", missing.to_hex())),
+            "{err:#}"
+        );
+        let features = read_repo_metadata(&repo.repository)?.unwrap().features;
+        assert!(features.incompatible.is_empty(), "{features:?}");
+        assert!(!test_path_exists_in_repo(
+            &tmp,
+            format!("{IMAGE_SETS_DIR}/refs/broken")
+        )?);
+        assert!(!test_object_exists(&tmp, &set.compute_id())?);
+        Ok(())
+    }
+
+    /// A `/usr/lib/modules` component image whose `/usr` has
+    /// `trusted.overlay.opaque`.  The writer escapes that xattr, so it is
+    /// written under a decoy name, then patched.
+    fn make_overlay_xattr_image(repo: &Repository<Sha512HashValue>) -> Result<Sha512HashValue> {
+        let fs = crate::dumpfile::dumpfile_to_validated_filesystem::<Sha512HashValue>(
+            "/ 0 40755 2 0 0 0 1000.0 - - -\n\
+             /usr 0 40755 2 0 0 0 1000.0 - - - trusted.ovxrlay.opaque=y\n\
+             /usr/lib 0 40755 2 0 0 0 1000.0 - - -\n\
+             /usr/lib/modules 0 40755 2 0 0 0 1000.0 - - -\n",
+        )?;
+        let mut image = crate::erofs::writer::mkfs_erofs_versioned(&fs, FormatVersion::V1).to_vec();
+        let at = image
+            .windows(7)
+            .position(|w| w == b"ovxrlay")
+            .context("decoy xattr name in image")?;
+        image[at..at + 7].copy_from_slice(b"overlay");
+        repo.write_image(None, &image)
+    }
+
+    #[test]
+    fn test_image_set_checks_components() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        let (images, _, _) = make_two_images(&repo)?;
+        let (outside, _) = make_image_at(&repo, "usr/lib/data", 0x44)?;
+        let overlay_xattr = make_overlay_xattr_image(&repo)?;
+        let mut wrong_format = image_set_of(&images).components().to_vec();
+        wrong_format[1].format = FormatVersion::V2;
+        for (set, expected) in [
+            (
+                image_set_of(&[images[0].clone(), outside]),
+                "contains /usr/lib/data outside its target",
+            ),
+            (
+                ImageSet::new(wrong_format).unwrap(),
+                "listed as v2, but its header has composefs version 1",
+            ),
+            (
+                image_set_of(&[images[0].clone(), overlay_xattr]),
+                "/usr has the overlayfs xattr trusted.overlay.opaque",
+            ),
+        ] {
+            let err = repo.write_image_set(None, &set).unwrap_err();
+            assert!(format!("{err:#}").contains(expected), "{err:#}");
+            let id = set.compute_id();
+            assert!(!test_object_exists(&tmp, &id)?);
+            // A refused set doesn't lock older versions out
+            let features = read_repo_metadata(&repo.repository)?.unwrap().features;
+            assert!(features.incompatible.is_empty(), "{features:?}");
+
+            // Mounting checks the components the same way, for a set that
+            // got into the repository some other way
+            let object = repo.ensure_object(&set.to_bytes())?;
+            assert_eq!(object, id);
+            repo.symlink(
+                format!("{IMAGE_SETS_DIR}/{}", id.to_hex()),
+                Repository::<Sha512HashValue>::format_object_path(&id),
+            )?;
+            let err = repo.mount_image_set(&id.to_hex()).unwrap_err();
+            assert!(format!("{err:#}").contains(expected), "{err:#}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_image_set_refs() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        let (images, _, _) = make_two_images(&repo)?;
+        let id = repo.write_image_set(Some("bootc/a"), &image_set_of(&images))?;
+        let refs = repo.list_image_set_refs("bootc/")?;
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].0, "a");
+        assert!(refs[0].1.ends_with(&id.to_hex()), "{refs:?}");
+
+        repo.remove_image_set_ref("bootc/a")?;
+        assert!(repo.list_image_set_refs("bootc/")?.is_empty());
+        repo.remove_image_set_ref("bootc/a")?;
+        // The set itself stays until GC
+        assert_eq!(repo.open_image_set(&id.to_hex())?.0, image_set_of(&images));
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_image_set_keeps_components() -> Result<()> {
+        // A set kept alive by a ref, or by an additional root, keeps its
+        // manifest, both component images and their objects.
+        for via_ref in [true, false] {
+            let tmp = tempdir();
+            let repo = create_test_repo(&tmp.path().join("repo"))?;
+            let (images, objects, unreferenced) = make_two_images(&repo)?;
+            let set = image_set_of(&images);
+            let id = repo.write_image_set(via_ref.then_some("myset"), &set)?;
+            repo.sync()?;
+
+            let id_hex = id.to_hex();
+            let roots: &[&str] = if via_ref { &[] } else { &[id_hex.as_str()] };
+            let result = repo.gc(roots)?;
+
+            assert!(
+                !test_object_exists(&tmp, &unreferenced)?,
+                "via_ref={via_ref}"
+            );
+            for kept in objects.iter().chain(&images).chain([&id]) {
+                assert!(test_object_exists(&tmp, kept)?, "via_ref={via_ref}");
+            }
+            for image in &images {
+                assert!(test_path_exists_in_repo(
+                    &tmp,
+                    format!("images/{}", image.to_hex())
+                )?);
+            }
+            assert!(test_path_exists_in_repo(
+                &tmp,
+                format!("{IMAGE_SETS_DIR}/{id_hex}")
+            )?);
+            assert_eq!(result.objects_removed, 1, "via_ref={via_ref}");
+            assert_eq!(result.images_pruned, 0);
+            assert_eq!(result.image_sets_pruned, 0);
+            assert_eq!(repo.open_image_set(&id_hex)?.0, set);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_removes_unreferenced_image_set() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        let (images, objects, unreferenced) = make_two_images(&repo)?;
+        let id = repo.write_image_set(Some("myset"), &image_set_of(&images))?;
+        repo.remove_image_set_ref("myset")?;
+        repo.sync()?;
+
+        let result = repo.gc(&[])?;
+
+        for gone in objects.iter().chain(&images).chain([&id, &unreferenced]) {
+            assert!(!test_object_exists(&tmp, gone)?);
+        }
+        assert!(!test_path_exists_in_repo(
+            &tmp,
+            format!("{IMAGE_SETS_DIR}/{}", id.to_hex())
+        )?);
+        // 3 data objects, 2 image objects and the manifest
+        assert_eq!(result.objects_removed, 6);
+        assert_eq!(result.images_pruned, 2);
+        assert_eq!(result.image_sets_pruned, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_image_sets_sharing_a_component() -> Result<()> {
+        // A live and a dead set share their root image: the dead set goes with
+        // the component only it has, and the shared one stays.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        let (images, objects, _) = make_two_images(&repo)?;
+        let (other_modules, other_object) = make_image_at(&repo, "usr/lib/modules/data", 0x55)?;
+        let live = repo.write_image_set(Some("live"), &image_set_of(&images))?;
+        let dead_set = image_set_of(&[images[0].clone(), other_modules.clone()]);
+        let dead = repo.write_image_set(None, &dead_set)?;
+        repo.sync()?;
+
+        let result = repo.gc(&[])?;
+
+        for kept in objects.iter().chain(&images).chain([&live]) {
+            assert!(test_object_exists(&tmp, kept)?);
+        }
+        for gone in [&other_modules, &other_object, &dead] {
+            assert!(!test_object_exists(&tmp, gone)?);
+        }
+        assert_eq!(result.images_pruned, 1);
+        assert_eq!(result.image_sets_pruned, 1);
+        assert_eq!(repo.open_image_set("live")?.0, image_set_of(&images));
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_keeps_all_images_for_unparseable_image_set() -> Result<()> {
+        // A live manifest this version can't parse, such as one of a newer
+        // format, doesn't stop GC: there's no telling which images it needs,
+        // so every image stays, however the manifest spells their digests.
+        // A dead one goes like any other.
+        let cases: [(&str, fn(&[Sha512HashValue; 2]) -> String); 4] = [
+            ("future version", |images| {
+                format!(
+                    "composefs-image-set 2\nalgorithm fsverity-sha512-12\nlayer {} /usr/lib/modules\n",
+                    images[1].to_hex()
+                )
+            }),
+            ("uppercase digest", |images| {
+                image_set_of(images)
+                    .to_string()
+                    .replace(&images[1].to_hex(), &images[1].to_hex().to_uppercase())
+            }),
+            ("other separators", |images| {
+                format!("composefs-image-set 2\nlayers=[{}]\n", images[1].to_hex())
+            }),
+            ("no digests at all", |_| {
+                "composefs-image-set 2\n".to_string()
+            }),
+        ];
+        for (what, manifest) in cases {
+            for live in [true, false] {
+                let tmp = tempdir();
+                let repo = create_test_repo(&tmp.path().join("repo"))?;
+                let (images, objects, unreferenced) = make_two_images(&repo)?;
+                let id = repo.ensure_object(manifest(&images).as_bytes())?;
+                let set_path = format!("{IMAGE_SETS_DIR}/{}", id.to_hex());
+                repo.symlink(
+                    &set_path,
+                    Repository::<Sha512HashValue>::format_object_path(&id),
+                )?;
+                if live {
+                    repo.symlink(format!("{IMAGE_SETS_DIR}/refs/future"), &set_path)?;
+                }
+                repo.sync()?;
+
+                let result = repo.gc(&[])?;
+
+                for image in images.iter().chain(&objects).chain([&id]) {
+                    assert_eq!(
+                        test_object_exists(&tmp, image)?,
+                        live,
+                        "{what}, live {live}"
+                    );
+                }
+                assert!(!test_object_exists(&tmp, &unreferenced)?, "{what}");
+                assert_eq!(result.image_sets_pruned, u64::from(!live), "{what}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fsck_image_sets() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        let (images, _, _) = make_two_images(&repo)?;
+        repo.write_image_set(Some("myset"), &image_set_of(&images))?;
+
+        let result = repo.fsck().await?;
+        assert!(result.is_ok(), "{result}");
+        assert_eq!(result.image_sets_checked(), 1);
+        assert!(
+            result.to_string().contains("image sets: 1/1 ok"),
+            "{result}"
+        );
+
+        // Lose a component
+        std::fs::remove_file(tmp.path().join("repo/images").join(images[1].to_hex()))?;
+        let result = repo.fsck().await?;
+        assert_eq!(result.image_sets_corrupted(), 1);
+        assert!(
+            result.errors().iter().any(|e| matches!(
+                e,
+                FsckError::ImageSetComponentInvalid { image, .. } if *image == images[1].to_hex()
+            )),
+            "{result}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_reset_metadata_removes_image_sets() -> Result<()> {
+        let tmp = tempdir();
+        let repo_path = tmp.path().join("repo");
+        let repo = create_test_repo(&repo_path)?;
+        let (images, _, _) = make_two_images(&repo)?;
+        repo.write_image_set(Some("myset"), &image_set_of(&images))?;
+        drop(repo);
+
+        reset_metadata(&repo_path)?;
+        for gone in ["images", IMAGE_SETS_DIR, REPO_METADATA_FILENAME] {
+            assert!(!test_path_exists_in_repo(&tmp, gone)?, "{gone}");
+        }
+        assert!(test_path_exists_in_repo(&tmp, "objects")?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_image_set_strict_swapped_manifest_is_refused() -> Result<()> {
+        let tmp = tempdir();
+        let repo_path = tmp.path().join("repo");
+        let repo = create_strict_test_repo(&repo_path)?;
+        let (images, objects, _) = make_two_images(&repo)?;
+        let first = repo.write_image_set(Some("first"), &image_set_of(&images))?;
+        let second = repo.write_image_set(None, &image_set_of(&images[..1]))?;
+
+        // Point the first set's link at the second set's manifest
+        relink(
+            &tmp,
+            &repo,
+            &format!("{IMAGE_SETS_DIR}/{}", first.to_hex()),
+            &Repository::<Sha512HashValue>::format_object_path(&second),
+        )?;
+        let err = repo.open_image_set(&first.to_hex()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("fs-verity content mismatch"),
+            "{err:#}"
+        );
+
+        // GC still runs, and keeps every image of the set it can't read.
+        repo.sync()?;
+        repo.gc(&[])?;
+        for kept in objects.iter().chain(&images) {
+            assert!(test_object_exists(&tmp, kept)?);
+        }
+
+        // Adding the feature kept meta.json's fs-verity, so the repository
+        // still opens as strict.
+        drop(repo);
+        assert!(!Repository::<Sha512HashValue>::open_path(CWD, &repo_path)?.is_insecure());
+        Ok(())
+    }
+
+    #[test]
+    fn test_image_set_strict_planted_refs_are_refused() -> Result<()> {
+        // With an entry's link gone, a ref named like its digest is looked up
+        // instead, and must still match the digest.
+        let tmp = tempdir();
+        let repo = create_strict_test_repo(&tmp.path().join("repo"))?;
+        let (images, _, _) = make_two_images(&repo)?;
+        let (other_modules, _) = make_image_at(&repo, "usr/lib/modules/data", 0x55)?;
+        let set = image_set_of(&images);
+        let id = repo.write_image_set(Some("myset"), &set)?;
+        let other = repo.write_image_set(None, &image_set_of(&images[..1]))?;
+        let mismatch = |err: anyhow::Error| {
+            assert!(
+                format!("{err:#}").contains("fs-verity content mismatch"),
+                "{err:#}"
+            );
+        };
+
+        // The manifest: image-sets/refs/<id> standing in for image-sets/<id>
+        let id_hex = id.to_hex();
+        std::fs::remove_file(tmp.path().join("repo").join(IMAGE_SETS_DIR).join(&id_hex))?;
+        repo.symlink(
+            format!("{IMAGE_SETS_DIR}/refs/{id_hex}"),
+            format!("{IMAGE_SETS_DIR}/{}", other.to_hex()),
+        )?;
+        mismatch(repo.open_image_set(&id_hex).unwrap_err());
+
+        // A component: images/refs/<digest> standing in for images/<digest>
+        let modules = images[1].to_hex();
+        std::fs::remove_file(tmp.path().join("repo/images").join(&modules))?;
+        repo.symlink(
+            format!("images/refs/{modules}"),
+            format!("images/{}", other_modules.to_hex()),
+        )?;
+        mismatch(repo.open_image(&modules).unwrap_err());
+        mismatch(repo.write_image_set(None, &set).unwrap_err());
+
+        // A ref that isn't named like a digest is still trusted as named.
+        repo.symlink(
+            format!("{IMAGE_SETS_DIR}/refs/named"),
+            format!("{IMAGE_SETS_DIR}/{}", other.to_hex()),
+        )?;
+        assert_eq!(
+            repo.open_image_set("named")?,
+            (image_set_of(&images[..1]), true)
+        );
         Ok(())
     }
 
