@@ -27,12 +27,23 @@ pub const KARG_V2: &str = "composefs";
 /// that exists in the repository.
 pub const KARG_COMPOSEFS_DIGEST: &str = "composefs.digest";
 
+/// The format descriptor of an [image set](composefs::image_set) in a
+/// `composefs.digest=` value: `composefs.digest=set1-<hash>-<lg>:<hex>` names
+/// the set whose manifest (format version 1) has that fs-verity digest.
+///
+/// Parsers that only know EROFS descriptors (`v1`, `v2`) reject it as an
+/// unsupported format version rather than mounting something else.
+pub const IMAGE_SET_DESCRIPTOR: &str = "set1";
+
 /// A composefs kernel argument identifying which EROFS image to mount at boot.
 ///
 /// Two variants exist to distinguish EROFS format versions:
 /// - [`ComposefsCmdline::V2`]: V2 EROFS — either `composefs=<digest>` (legacy shorthand)
 ///   or `composefs.digest=v2-<hash>-<lg>:<digest>` (explicit form)
 /// - [`ComposefsCmdline::V1`]: V1 EROFS — `composefs.digest=v1-<hash>-<lg>:<digest>`
+///
+/// A third, [`ComposefsCmdline::ImageSet`], names an image set
+/// (`composefs.digest=set1-<hash>-<lg>:<digest>`) instead of a single image.
 ///
 /// The initramfs checks for `composefs.digest=` first (accepting both `v1` and `v2`
 /// descriptors), then falls back to the legacy `composefs=` shorthand.
@@ -70,6 +81,15 @@ pub enum ComposefsCmdline<ObjectID: FsVerityHashValue> {
         /// making fs-verity verification optional at boot.
         insecure: bool,
     },
+    /// An image set: `composefs.digest=set1-<hash>-<lg>:<hex-digest>`, where the
+    /// digest is that of the set's manifest (see [`IMAGE_SET_DESCRIPTOR`]).
+    ImageSet {
+        /// The fs-verity hash of the image set manifest.
+        digest: ObjectID,
+        /// If `true`, a `?` prefix is added before the format descriptor in the value,
+        /// making fs-verity verification optional at boot.
+        insecure: bool,
+    },
 }
 
 impl<ObjectID: FsVerityHashValue> ComposefsCmdline<ObjectID> {
@@ -78,7 +98,9 @@ impl<ObjectID: FsVerityHashValue> ComposefsCmdline<ObjectID> {
     /// Useful for looking up the image in `composefs/images/<digest>`.
     pub fn digest(&self) -> &ObjectID {
         match self {
-            ComposefsCmdline::V2 { digest, .. } | ComposefsCmdline::V1 { digest, .. } => digest,
+            ComposefsCmdline::V2 { digest, .. }
+            | ComposefsCmdline::V1 { digest, .. }
+            | ComposefsCmdline::ImageSet { digest, .. } => digest,
         }
     }
 
@@ -114,9 +136,9 @@ impl<ObjectID: FsVerityHashValue> ComposefsCmdline<ObjectID> {
     /// Returns whether this karg is in insecure mode (fs-verity verification skipped).
     pub fn is_insecure(&self) -> bool {
         match self {
-            ComposefsCmdline::V1 { insecure, .. } | ComposefsCmdline::V2 { insecure, .. } => {
-                *insecure
-            }
+            ComposefsCmdline::V1 { insecure, .. }
+            | ComposefsCmdline::V2 { insecure, .. }
+            | ComposefsCmdline::ImageSet { insecure, .. } => *insecure,
         }
     }
 
@@ -130,18 +152,30 @@ impl<ObjectID: FsVerityHashValue> ComposefsCmdline<ObjectID> {
         ComposefsCmdline::V1 { digest, insecure }
     }
 
+    /// Constructs an image set cmdline value (`composefs.digest=set1-<hash>-<lg>:<hex>`).
+    pub fn new_image_set(digest: ObjectID, insecure: bool) -> Self {
+        ComposefsCmdline::ImageSet { digest, insecure }
+    }
+
+    /// Returns whether this names an image set rather than a single image.
+    pub fn is_image_set(&self) -> bool {
+        matches!(self, ComposefsCmdline::ImageSet { .. })
+    }
+
     /// Parses a [`ComposefsCmdline`] from a kernel command line string.
     ///
-    /// Scans for `composefs.digest=` tokens first (→ [`ComposefsCmdline::V1`]).  Multiple
-    /// such tokens may appear on the cmdline (different algorithms); the first one whose
-    /// format descriptor matches the `ObjectID` algorithm is returned.  Then falls back to
-    /// `composefs=` (→ [`ComposefsCmdline::V2`]).  Returns `None` if no matching token is
-    /// present.
+    /// Scans for `composefs.digest=` tokens first: `set1-<hash>-<lg>:<hex>` names an image
+    /// set (→ [`ComposefsCmdline::ImageSet`]), and `v1-<hash>-<lg>:<hex>` an image
+    /// (→ [`ComposefsCmdline::V1`]).  Multiple such tokens may appear on the cmdline
+    /// (different algorithms); the first one whose algorithm matches the `ObjectID` type is
+    /// returned.  Then falls back to `composefs=` (→ [`ComposefsCmdline::V2`]).  Returns
+    /// `None` if no matching token is present.
     ///
     /// # Errors
     ///
-    /// Returns an error if a matching karg is found but the hex digest cannot be parsed
-    /// for the given `ObjectID` type.
+    /// Returns an error if a `composefs.digest=` token has an unknown format version (such
+    /// as an older version reading an image set's `set1`), or if a matching karg is found
+    /// but the hex digest cannot be parsed for the given `ObjectID` type.
     pub fn from_cmdline(cmdline: &str) -> Result<Option<Self>> {
         let expected_hex_len = size_of::<ObjectID>() * 2;
 
@@ -159,6 +193,25 @@ impl<ObjectID: FsVerityHashValue> ComposefsCmdline<ObjectID> {
             } else {
                 (val, false)
             };
+            if let Some(rest) = val_no_q
+                .strip_prefix(IMAGE_SET_DESCRIPTOR)
+                .and_then(|rest| rest.strip_prefix('-'))
+            {
+                let (algorithm, hex) = parse_algorithm_and_hex(rest)
+                    .with_context(|| format!("parsing {KARG_COMPOSEFS_DIGEST}= value: {val}"))?;
+                if !algorithm.is_compatible::<ObjectID>() {
+                    continue;
+                }
+                let digest = ObjectID::from_hex(hex).with_context(|| {
+                    format!(
+                        "parsing {KARG_COMPOSEFS_DIGEST}= image set hash: got {} hex chars, expected {} for {}",
+                        hex.len(),
+                        expected_hex_len,
+                        ObjectID::ALGORITHM,
+                    )
+                })?;
+                return Ok(Some(ComposefsCmdline::ImageSet { digest, insecure }));
+            }
             let (desc, hex) = parse_digest_value(val_no_q)
                 .with_context(|| format!("parsing {KARG_COMPOSEFS_DIGEST}= value: {val}"))?;
             if !desc.algorithm.is_compatible::<ObjectID>() {
@@ -206,6 +259,7 @@ impl<ObjectID: FsVerityHashValue> ComposefsCmdline<ObjectID> {
     /// - [`ComposefsCmdline::V1`] (insecure) → `"composefs.digest=?v1-<hash>-<lg>:<hex>"`
     /// - [`ComposefsCmdline::V2`] (secure)   → `"composefs=<hex>"`
     /// - [`ComposefsCmdline::V2`] (insecure) → `"composefs=?<hex>"`
+    /// - [`ComposefsCmdline::ImageSet`] → `"composefs.digest=[?]set1-<hash>-<lg>:<hex>"`
     pub fn to_cmdline_arg(&self) -> String {
         let verity_suffix = ObjectID::ALGORITHM.verity_suffix();
         match self {
@@ -235,6 +289,11 @@ impl<ObjectID: FsVerityHashValue> ComposefsCmdline<ObjectID> {
             } => {
                 format!("{KARG_V2}=?{}", digest.to_hex())
             }
+            ComposefsCmdline::ImageSet { digest, insecure } => format!(
+                "{KARG_COMPOSEFS_DIGEST}={}{IMAGE_SET_DESCRIPTOR}-{verity_suffix}:{}",
+                if *insecure { "?" } else { "" },
+                digest.to_hex()
+            ),
         }
     }
 }
@@ -296,12 +355,29 @@ pub fn parse_digest_value(s: &str) -> Result<(DigestDescriptor, &str)> {
         _ => anyhow::bail!("unsupported format version '{version_str}'"),
     };
 
-    // Reuse Algorithm's parser by prepending the expected "fsverity-" prefix.
-    let algorithm: Algorithm = format!("fsverity-{hash_and_bs}")
-        .parse()
-        .with_context(|| format!("parsing algorithm from '{hash_and_bs}'"))?;
+    Ok((
+        DigestDescriptor {
+            version,
+            algorithm: parse_algorithm(hash_and_bs)?,
+        },
+        hex,
+    ))
+}
 
-    Ok((DigestDescriptor { version, algorithm }, hex))
+/// Parse `<hash>-<lg>` (e.g. `sha512-12`) as an fs-verity algorithm.
+fn parse_algorithm(hash_and_bs: &str) -> Result<Algorithm> {
+    // Reuse Algorithm's parser by prepending the expected "fsverity-" prefix.
+    format!("fsverity-{hash_and_bs}")
+        .parse()
+        .with_context(|| format!("parsing algorithm from '{hash_and_bs}'"))
+}
+
+/// Parse `<hash>-<lg>:<hex>`, the part of an image set value after its descriptor.
+fn parse_algorithm_and_hex(s: &str) -> Result<(Algorithm, &str)> {
+    let (hash_and_bs, hex) = s
+        .split_once(':')
+        .with_context(|| format!("expected '<hash>-<blocksize>:<hex>', got: {s}"))?;
+    Ok((parse_algorithm(hash_and_bs)?, hex))
 }
 
 /// Creates a composefs kernel command line argument string.
@@ -667,6 +743,74 @@ mod tests {
         assert!(
             err.to_string().contains("should be one of"),
             "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_composefs_cmdline_image_set() {
+        let digest256 = Sha256HashValue::from_hex(SHA256_HEX).unwrap();
+        let digest512 = Sha512HashValue::from_hex(SHA512_HEX).unwrap();
+        for insecure in [false, true] {
+            let q = if insecure { "?" } else { "" };
+            let karg = ComposefsCmdline::new_image_set(digest512.clone(), insecure);
+            assert_eq!(
+                karg.to_cmdline_arg(),
+                format!("composefs.digest={q}set1-sha512-12:{SHA512_HEX}")
+            );
+            let parsed = ComposefsCmdline::<Sha512HashValue>::from_cmdline(&format!(
+                "root=UUID=abc {} rw",
+                karg.to_cmdline_arg()
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(parsed, karg);
+            assert!(parsed.is_image_set());
+            assert_eq!(parsed.is_insecure(), insecure);
+            assert_eq!(parsed.digest(), &digest512);
+
+            let karg = ComposefsCmdline::new_image_set(digest256.clone(), insecure);
+            let parsed = ComposefsCmdline::<Sha256HashValue>::from_cmdline(&karg.to_cmdline_arg())
+                .unwrap()
+                .unwrap();
+            assert_eq!(parsed, karg);
+        }
+        assert!(!ComposefsCmdline::new_v1(digest512, false).is_image_set());
+
+        // A sha256 set is skipped by the sha512 parser, like other descriptors
+        let cmdline = format!("composefs.digest=set1-sha256-12:{SHA256_HEX}");
+        assert!(
+            ComposefsCmdline::<Sha512HashValue>::from_cmdline(&cmdline)
+                .unwrap()
+                .is_none()
+        );
+
+        for (cmdline, expected) in [
+            (
+                format!("composefs.digest=set1-sha512-12:{SHA256_HEX}"),
+                "image set hash",
+            ),
+            (
+                format!("composefs.digest=set1-sha512-99:{SHA512_HEX}"),
+                "unsupported",
+            ),
+            (
+                format!("composefs.digest=set1-sha512-12{SHA512_HEX}"),
+                "expected '<hash>",
+            ),
+            (
+                format!("composefs.digest=set2-sha512-12:{SHA512_HEX}"),
+                "unsupported format version",
+            ),
+        ] {
+            let err = ComposefsCmdline::<Sha512HashValue>::from_cmdline(&cmdline).unwrap_err();
+            assert!(format!("{err:#}").contains(expected), "{cmdline}: {err:#}");
+        }
+
+        // EROFS-only parsers refuse the descriptor instead of misreading it
+        let err = parse_digest_value(&format!("set1-sha512-12:{SHA512_HEX}")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported format version 'set1'")
         );
     }
 
