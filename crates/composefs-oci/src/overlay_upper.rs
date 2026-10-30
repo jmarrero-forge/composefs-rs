@@ -4,7 +4,7 @@
 //! overlayfs mounted over an image leaves exactly its changes in the overlay's
 //! upper directory. [`write_upper_tar`] writes that directory as an OCI tar
 //! layer, and [`import_upper`] imports it into a repository, so that it can be
-//! stacked on the base image's layers (see `derive_image`).
+//! stacked on the base image's layers (see [`crate::derive_image`]).
 //!
 //! The upper must come from an overlay mounted with `metacopy=off`,
 //! `redirect_dir=off` and `index=off`, which keeps it self-contained: every

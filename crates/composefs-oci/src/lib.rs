@@ -20,6 +20,7 @@ pub mod boot;
 #[cfg(feature = "containers-storage")]
 pub mod cstor;
 pub(crate) mod delta;
+pub mod derive;
 pub mod image;
 pub mod layer;
 pub mod layer_sync;
@@ -57,6 +58,7 @@ pub mod sealing_spec;
 
 // Re-export the composefs crate for consumers who only need composefs-oci
 pub use composefs;
+pub use derive::{DerivedLayer, derive_image};
 
 use std::io::Read;
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
