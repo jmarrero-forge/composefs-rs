@@ -370,6 +370,38 @@ enum OciCommand {
         /// Optional human-readable name for the layer
         name: Option<String>,
     },
+    /// Add an overlayfs upper directory to an image as one new layer
+    ///
+    /// UPPER is the upper directory of an overlay mounted over IMAGE with
+    /// metacopy=off, redirect_dir=off and index=off, after something (a
+    /// package manager, `tar -x`) changed files through it. Whiteouts and
+    /// opaque directories become OCI whiteouts. Prints the derived image's
+    /// manifest digest.
+    DeriveFromUpper {
+        /// Base image (tag name or manifest digest)
+        image: String,
+        /// The overlay's upper directory
+        upper: PathBuf,
+        /// Tag for the derived image
+        #[clap(long)]
+        tag: Option<String>,
+        /// The new layer's history entry
+        #[clap(long, default_value = "cfsctl oci derive-from-upper")]
+        created_by: String,
+        /// RFC 3339 creation time to record (default: keep the base's)
+        #[clap(long)]
+        created: Option<String>,
+        /// Top-level entry of UPPER to leave out (repeatable)
+        #[clap(long)]
+        exclude: Vec<OsString>,
+        /// A mount of IMAGE: directories of UPPER that it has with the same
+        /// metadata are left out, keeping the base's directory metadata
+        #[clap(long)]
+        lower: Option<PathBuf>,
+        /// The overlay was mounted with userxattr (user.overlay.* xattrs)
+        #[clap(long)]
+        userxattr: bool,
+    },
     /// Dump the rootfs of a stored OCI image as a composefs dumpfile to stdout
     ///
     /// The image can be specified by ref name or @digest:
@@ -1780,6 +1812,57 @@ where
                 )
                 .await?;
                 println!("{}", object_id.to_id());
+            }
+            OciCommand::DeriveFromUpper {
+                ref image,
+                ref upper,
+                ref tag,
+                ref created_by,
+                ref created,
+                ref exclude,
+                ref lower,
+                userxattr,
+            } => {
+                let base = if image.starts_with("sha256:") {
+                    image.parse().context("Parsing manifest digest")?
+                } else {
+                    composefs_oci::oci_image::OciImage::open_ref(&repo, image)?
+                        .manifest_digest()
+                        .clone()
+                };
+                let exclude: Vec<&std::ffi::OsStr> =
+                    exclude.iter().map(|e| e.as_os_str()).collect();
+                let opts = composefs_oci::overlay_upper::UpperOptions {
+                    excluded: &exclude,
+                    lower: lower.as_deref(),
+                    userxattr,
+                };
+                // The layer is staged in an unlinked file next to the upper,
+                // on a filesystem with room for it (a tmpfs $TMPDIR may not).
+                let tmpdir = upper
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                let layer =
+                    composefs_oci::overlay_upper::import_upper(&repo, upper, &opts, tmpdir).await?;
+                eprintln!(
+                    "layer {} ({} bytes): {:?}",
+                    layer.diff_id, layer.size, layer.upper
+                );
+                let derived = composefs_oci::derive_image(
+                    &repo,
+                    &base,
+                    &[composefs_oci::DerivedLayer {
+                        diff_id: layer.diff_id,
+                        verity: layer.verity,
+                        size: layer.size,
+                        created_by: created_by.clone(),
+                    }],
+                    &[],
+                    created.as_deref(),
+                    tag.as_deref(),
+                )?;
+                println!("{}", derived.manifest_digest);
             }
             OciCommand::Dump { config_opts } => {
                 let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
