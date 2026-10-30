@@ -1034,6 +1034,54 @@ impl<'img> Image<'img> {
         Ok(())
     }
 
+    /// Lists the entries of the directory inode `nid`, other than `.` and `..`, as their
+    /// names and inode numbers.
+    pub fn directory_entries(&self, nid: u64) -> Result<Vec<(Vec<u8>, u64)>, ErofsReaderError> {
+        let inode = self.inode(nid)?;
+        if !inode.mode().is_dir() {
+            return Err(ErofsReaderError::InvalidImage(format!(
+                "inode {nid} is not a directory"
+            )));
+        }
+        let mut blocks = Vec::new();
+        if let Some(inline) = inode.inline()
+            && let Ok(block) = DirectoryBlock::ref_from_bytes(inline)
+        {
+            blocks.push(block);
+        }
+        for blkid in self.inode_blocks(&inode)? {
+            blocks.push(self.directory_block(blkid)?);
+        }
+        let mut entries = Vec::new();
+        for block in blocks {
+            for entry in block.entries()? {
+                let entry = entry?;
+                if entry.name != b"." && entry.name != b".." {
+                    entries.push((entry.name.to_vec(), entry.nid()));
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Lists the full names (such as `trusted.overlay.opaque`) of the extended
+    /// attributes of inode `nid`, shared and local, as they are stored: escaped
+    /// names are not unescaped and internal ones are not left out.
+    pub fn xattr_names(&self, nid: u64) -> Result<Vec<Vec<u8>>, ErofsReaderError> {
+        let inode = self.inode(nid)?;
+        let Some(xattrs) = inode.xattrs()? else {
+            return Ok(Vec::new());
+        };
+        let mut names = Vec::new();
+        for id in xattrs.shared()? {
+            names.push(construct_xattr_name(self.shared_xattr(id.get())?)?);
+        }
+        for xattr in xattrs.local()? {
+            names.push(construct_xattr_name(xattr?)?);
+        }
+        Ok(names)
+    }
+
     /// Finds a child directory entry by name within a directory inode.
     ///
     /// Returns the nid (inode number) of the child if found.
@@ -1742,7 +1790,7 @@ fn dir_entries<'a>(
 
 /// Maximum directory nesting depth. PATH_MAX is 4096 on Linux, and directory names
 /// must be at least 2 bytes (1 char + separator), so the theoretical max is PATH_MAX / 2.
-const MAX_DIRECTORY_DEPTH: usize = 4096 / 2;
+pub(crate) const MAX_DIRECTORY_DEPTH: usize = 4096 / 2;
 
 /// Per-leaf nlink tracking for post-traversal validation.
 struct NlinkEntry {

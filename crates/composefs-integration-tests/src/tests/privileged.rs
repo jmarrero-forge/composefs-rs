@@ -654,6 +654,440 @@ fn privileged_mount_upper_layer() -> Result<()> {
 }
 integration_test!(privileged_mount_upper_layer);
 
+/// A repository in `dir` that requires fs-verity.
+fn strict_sha512_repo(dir: &Path) -> Result<Repository<Sha512HashValue>> {
+    let (repo, _) = Repository::<Sha512HashValue>::init_path(
+        rustix::fs::CWD,
+        dir.join("repo"),
+        RepositoryConfig::new(composefs_oci::composefs::fsverity::Algorithm::SHA512),
+    )?;
+    ensure!(!repo.is_insecure(), "repository should require fs-verity");
+    Ok(repo)
+}
+
+/// Reads the directory tree at `rootfs` like cfsctl does, with large files
+/// stored in `repo`.
+fn read_rootfs(
+    repo: &Arc<Repository<Sha512HashValue>>,
+    rootfs: &Path,
+) -> Result<composefs_oci::composefs::tree::FileSystem<Sha512HashValue>> {
+    // Like cfsctl: the path is absolute, but the API needs a directory fd.
+    let dirfd = rustix::fs::open(
+        ".",
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    tokio::runtime::Runtime::new()?.block_on(composefs_oci::composefs::fs::read_filesystem(
+        dirfd,
+        rootfs.to_path_buf(),
+        Some(repo.clone()),
+    ))
+}
+
+/// Mounts the image set `id` of `repo`, runs `check` on the mount point,
+/// and unmounts it.
+fn check_image_set_mount(
+    repo: &Repository<Sha512HashValue>,
+    id: &str,
+    check: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    let mountpoint = tempfile::tempdir()?;
+    let mnt = mountpoint.path();
+    composefs_oci::composefs::mount::mount_at(repo.mount_image_set(id)?, rustix::fs::CWD, mnt)?;
+    let result = check(mnt);
+    let sh = Shell::new()?;
+    cmd!(sh, "umount {mnt}").run()?;
+    result
+}
+
+/// The names in the directory `path`, sorted.
+fn dir_names(path: &Path) -> Result<Vec<String>> {
+    let mut names = std::fs::read_dir(path)?
+        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<Vec<_>>>()?;
+    names.sort();
+    Ok(names)
+}
+
+/// Mount an image set of two images, the root filesystem and its
+/// `/usr/lib/modules` split off into an image of its own, from a repository
+/// that requires fs-verity, and check that the mount shows the whole tree.
+///
+/// cfsctl has no image set commands, so this goes through the library.
+fn privileged_image_set_mount() -> Result<()> {
+    use std::ffi::OsStr;
+
+    use composefs_oci::composefs::image_set::{ImageSet, ImageSetComponent};
+
+    if require_privileged("privileged_image_set_mount")?.is_some() {
+        return Ok(());
+    }
+
+    let verity_dir = VerityTempDir::new()?;
+    let repo = Arc::new(strict_sha512_repo(verity_dir.path())?);
+
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+    let kver = rootfs.join("usr/lib/modules/6.1.0");
+    std::fs::create_dir_all(kver.join("kernel"))?;
+    let module = "m".repeat(128 * 1024);
+    std::fs::write(kver.join("kernel/test.ko"), &module)?;
+    std::fs::write(kver.join("modules.dep"), "kernel/test.ko:\n")?;
+
+    let mut fs = read_rootfs(&repo, &rootfs)?;
+    let modules = fs.split_off(OsStr::new("/usr/lib/modules"))?;
+    let format = repo.erofs_version();
+    let component = |digest, target: &str| ImageSetComponent {
+        digest,
+        format,
+        target: target.into(),
+    };
+    let set = ImageSet::new(vec![
+        component(fs.commit_image(&repo, None)?, "/"),
+        component(modules.commit_image(&repo, None)?, "/usr/lib/modules"),
+    ])?;
+    let id = repo.write_image_set(Some("test"), &set)?.to_hex();
+
+    check_image_set_mount(&repo, &id, |mnt| {
+        let read = |path: &str| std::fs::read_to_string(mnt.join(path));
+        let names = |path: &str| dir_names(&mnt.join(path));
+        // From the root image
+        ensure!(read("etc/hostname")? == "integration-test\n");
+        ensure!(read("usr/bin/hello")? == "x".repeat(128 * 1024));
+        // From the modules image, merged into the root image's /usr/lib
+        ensure!(read("usr/lib/modules/6.1.0/kernel/test.ko")? == module);
+        ensure!(read("usr/lib/modules/6.1.0/modules.dep")? == "kernel/test.ko:\n");
+        ensure!(
+            names("usr/lib")? == ["modules", "readme.txt"],
+            "{:?}",
+            names("usr/lib")
+        );
+        ensure!(names("usr/lib/modules")? == ["6.1.0"]);
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")?;
+        let line = mountinfo
+            .lines()
+            .find(|line| line.contains(&format!("composefs:{id}")))
+            .context("image set mount not in mountinfo")?;
+        ensure!(line.contains("verity=require"), "{line}");
+        Ok(())
+    })
+}
+integration_test!(privileged_image_set_mount);
+
+/// The writer escapes `trusted.overlay.*` xattrs, so the image set tests
+/// write unescaped ones under this decoy name and patch it.
+const OVERLAY_DECOY: &[u8] = b"ovxrlay";
+
+/// Writes the image of `dumpfile`, under a root directory entry, into `repo`,
+/// with every [`OVERLAY_DECOY`] patched to `overlay`.  The superblock's xattr
+/// name filter is turned off in a patched image, so that the kernel doesn't
+/// skip the patched names.
+fn write_patched_image(
+    repo: &Repository<Sha512HashValue>,
+    dumpfile: &str,
+) -> Result<Sha512HashValue> {
+    use composefs_oci::composefs::{
+        dumpfile::dumpfile_to_validated_filesystem,
+        erofs::{
+            format::{FEATURE_COMPAT_XATTR_FILTER, Superblock},
+            writer::mkfs_erofs_versioned,
+        },
+    };
+
+    /// Where the EROFS superblock starts in a composefs image.
+    const SUPERBLOCK_OFFSET: usize = 1024;
+    const FEATURE_COMPAT: usize =
+        SUPERBLOCK_OFFSET + std::mem::offset_of!(Superblock, feature_compat);
+
+    let dumpfile = format!("/ 0 40755 2 0 0 0 1000.0 - - -\n{dumpfile}");
+    let fs = dumpfile_to_validated_filesystem::<Sha512HashValue>(&dumpfile)?;
+    let mut data = mkfs_erofs_versioned(&fs, repo.erofs_version()).to_vec();
+    let mut patched = false;
+    while let Some(at) = data
+        .windows(OVERLAY_DECOY.len())
+        .position(|w| w == OVERLAY_DECOY)
+    {
+        data[at..at + OVERLAY_DECOY.len()].copy_from_slice(b"overlay");
+        patched = true;
+    }
+    if patched {
+        let compat = &mut data[FEATURE_COMPAT..FEATURE_COMPAT + 4];
+        let flags = u32::from_le_bytes(compat.try_into()?) & !FEATURE_COMPAT_XATTR_FILTER;
+        compat.copy_from_slice(&flags.to_le_bytes());
+    }
+    repo.write_image(None, &data)
+}
+
+/// Overlayfs xattrs on a component's ancestor directories are refused.
+/// overlayfs (with `redirect_dir=on`) acts on them in every lower layer but
+/// the last, so `trusted.overlay.redirect` could show the files of a
+/// component below outside its target, and `trusted.overlay.opaque` could
+/// hide them.
+///
+/// The set is the root, a `/usr/lib/modules` component whose `/usr` carries
+/// the xattr, and a `/usr/lib/firmware` component below it.
+fn privileged_image_set_overlay_xattrs() -> Result<()> {
+    use composefs_oci::composefs::image_set::{ImageSet, ImageSetComponent};
+
+    const ROOT: &str = "\
+/usr 0 40755 2 0 0 0 1000.0 - - -
+/usr/bin 0 40755 2 0 0 0 1000.0 - - -
+/usr/bin/true 4 100755 1 0 0 0 1000.0 - root -
+/usr/lib 0 40755 2 0 0 0 1000.0 - - -
+/usr/lib/firmware 0 40755 2 0 0 0 1000.0 - - -
+/usr/lib/modules 0 40755 2 0 0 0 1000.0 - - -
+";
+    const FIRMWARE: &str = "\
+/usr 0 40755 2 0 0 0 1000.0 - - -
+/usr/lib 0 40755 2 0 0 0 1000.0 - - -
+/usr/lib/firmware 0 40755 2 0 0 0 1000.0 - - -
+/usr/lib/firmware/fw.bin 2 100644 1 0 0 0 1000.0 - fw -
+/usr/lib/firmware/inject 0 40755 2 0 0 0 1000.0 - - -
+/usr/lib/firmware/inject/bin 0 40755 2 0 0 0 1000.0 - - -
+/usr/lib/firmware/inject/bin/evil 4 100755 1 0 0 0 1000.0 - evil -
+";
+    let modules = |usr_xattr: &str| {
+        format!(
+            "\
+/usr 0 40755 2 0 0 0 1000.0 - - - {usr_xattr}
+/usr/lib 0 40755 2 0 0 0 1000.0 - - -
+/usr/lib/modules 0 40755 2 0 0 0 1000.0 - - -
+/usr/lib/modules/a.ko 1 100644 1 0 0 0 1000.0 - a -
+"
+        )
+    };
+
+    if require_privileged("privileged_image_set_overlay_xattrs")?.is_some() {
+        return Ok(());
+    }
+    let verity_dir = VerityTempDir::new()?;
+    let repo = strict_sha512_repo(verity_dir.path())?;
+    let format = repo.erofs_version();
+    let image = |dumpfile: &str| write_patched_image(&repo, dumpfile);
+    let component = |digest, target: &str| ImageSetComponent {
+        digest,
+        format,
+        target: target.into(),
+    };
+    let root = image(ROOT)?;
+    let firmware = image(FIRMWARE)?;
+    for (xattr, refused) in [
+        ("user.foo=bar", false),
+        // Escaped by the writer, or not used by the mount
+        ("trusted.overlay.opaque=y", false),
+        ("user.overlay.opaque=y", false),
+        ("user.overlay.redirect=/usr/lib/firmware/inject", false),
+        ("trusted.ovxrlay.redirect=/usr/lib/firmware/inject", true),
+        ("trusted.ovxrlay.opaque=y", true),
+    ] {
+        let set = ImageSet::new(vec![
+            component(root.clone(), "/"),
+            component(image(&modules(xattr))?, "/usr/lib/modules"),
+            component(firmware.clone(), "/usr/lib/firmware"),
+        ])?;
+        match repo.write_image_set(None, &set) {
+            Err(err) => {
+                let err = format!("{err:#}");
+                ensure!(refused, "{xattr}: write_image_set refused: {err}");
+                ensure!(
+                    err.contains("/usr has the overlayfs xattr trusted.overlay."),
+                    "{xattr}: {err}"
+                );
+            }
+            Ok(id) => {
+                check_image_set_mount(&repo, &id.to_hex(), |mnt| {
+                    for (dir, expected) in [
+                        ("usr/bin", &["true"][..]),
+                        ("usr/lib/firmware", &["fw.bin", "inject"]),
+                        ("usr/lib/modules", &["a.ko"]),
+                    ] {
+                        let names = dir_names(&mnt.join(dir))?;
+                        ensure!(names == expected, "/{dir} has {names:?}, not {expected:?}");
+                    }
+                    Ok(())
+                })
+                .with_context(|| format!("{xattr} on /usr of the modules image"))?;
+                ensure!(!refused, "{xattr}: write_image_set accepted it");
+            }
+        }
+    }
+    Ok(())
+}
+integration_test!(privileged_image_set_overlay_xattrs);
+
+/// Overlayfs xattrs on the directories inside a component's target are
+/// refused too.  An absolute `trusted.overlay.redirect` restarts the lookup
+/// at the root of the layers below, so a `/usr/share` component whose
+/// `/usr/share/inject` is redirected to `/usr/lib` would show the files of a
+/// `/usr/lib/modules` component below it under `/usr/share/inject/modules`.
+/// The writer's own `trusted.overlay.metacopy` and `trusted.overlay.redirect`
+/// on a regular file, which name its object, are fine.
+fn privileged_image_set_descendant_xattrs() -> Result<()> {
+    use composefs_oci::composefs::image_set::{ImageSet, ImageSetComponent};
+
+    const ROOT: &str = "\
+/usr 0 40755 2 0 0 0 1000.0 - - -
+/usr/lib 0 40755 2 0 0 0 1000.0 - - -
+/usr/lib/modules 0 40755 2 0 0 0 1000.0 - - -
+/usr/share 0 40755 2 0 0 0 1000.0 - - -
+";
+    const MODULES: &str = "\
+/usr 0 40755 2 0 0 0 1000.0 - - -
+/usr/lib 0 40755 2 0 0 0 1000.0 - - -
+/usr/lib/modules 0 40755 2 0 0 0 1000.0 - - -
+/usr/lib/modules/payload.ko 8 100644 1 0 0 0 1000.0 - payload! -
+";
+    /// An external file of the `/usr/share` component, larger than any inline one.
+    const DATA: &[u8] = &[b'd'; 64 * 1024];
+
+    if require_privileged("privileged_image_set_descendant_xattrs")?.is_some() {
+        return Ok(());
+    }
+    let verity_dir = VerityTempDir::new()?;
+    let repo = strict_sha512_repo(verity_dir.path())?;
+    let format = repo.erofs_version();
+    let data = repo.ensure_object(DATA)?;
+    let share = |xattr: &str| {
+        format!(
+            "\
+/usr 0 40755 2 0 0 0 1000.0 - - -
+/usr/share 0 40755 2 0 0 0 1000.0 - - -
+/usr/share/data {} 100644 1 0 0 0 1000.0 {} - {}
+/usr/share/inject 0 40755 2 0 0 0 1000.0 - - - {xattr}
+",
+            DATA.len(),
+            data.to_object_pathname(),
+            data.to_hex()
+        )
+    };
+    let component = |digest, target: &str| ImageSetComponent {
+        digest,
+        format,
+        target: target.into(),
+    };
+    let root = write_patched_image(&repo, ROOT)?;
+    let modules = write_patched_image(&repo, MODULES)?;
+    for (xattr, refused) in [
+        ("user.foo=bar", false),
+        // Escaped by the writer
+        ("trusted.overlay.redirect=/usr/lib", false),
+        ("trusted.ovxrlay.redirect=/usr/lib", true),
+        ("trusted.ovxrlay.opaque=y", true),
+    ] {
+        let set = ImageSet::new(vec![
+            component(root.clone(), "/"),
+            component(write_patched_image(&repo, &share(xattr))?, "/usr/share"),
+            component(modules.clone(), "/usr/lib/modules"),
+        ])?;
+        match repo.write_image_set(None, &set) {
+            Err(err) => {
+                let err = format!("{err:#}");
+                ensure!(refused, "{xattr}: write_image_set refused: {err}");
+                ensure!(
+                    err.contains("/usr/share/inject has the overlayfs xattr trusted.overlay."),
+                    "{xattr}: {err}"
+                );
+            }
+            Ok(id) => {
+                check_image_set_mount(&repo, &id.to_hex(), |mnt| {
+                    let inject = dir_names(&mnt.join("usr/share/inject"))?;
+                    let payload =
+                        std::fs::read_to_string(mnt.join("usr/share/inject/modules/payload.ko"));
+                    ensure!(
+                        inject.is_empty(),
+                        "/usr/share/inject has {inject:?}, \
+                         and /usr/share/inject/modules/payload.ko reads {payload:?}"
+                    );
+                    ensure!(std::fs::read(mnt.join("usr/share/data"))? == DATA);
+                    let modules = dir_names(&mnt.join("usr/lib/modules"))?;
+                    ensure!(
+                        modules == ["payload.ko"],
+                        "/usr/lib/modules has {modules:?}"
+                    );
+                    Ok(())
+                })
+                .with_context(|| format!("{xattr} on /usr/share/inject"))?;
+                ensure!(!refused, "{xattr}: write_image_set accepted it");
+            }
+        }
+    }
+    Ok(())
+}
+integration_test!(privileged_image_set_descendant_xattrs);
+
+/// A target whose first directory is named like a whiteout stub is refused.
+/// Every V0/V1 image has whiteout stubs `00` to `ff` at its root for the names
+/// it lacks, and they hide those names in the layers below, so with the
+/// targets `/usr/lib/modules` then `/ab/x`, the modules image's `/ab` stub
+/// would hide all of the `/ab/x` image.  A name that only looks similar works.
+fn privileged_image_set_stub_named_target() -> Result<()> {
+    use std::ffi::OsStr;
+
+    use composefs_oci::composefs::{
+        erofs::format::FormatVersion,
+        image_set::{ImageSet, ImageSetComponent},
+    };
+
+    if require_privileged("privileged_image_set_stub_named_target")?.is_some() {
+        return Ok(());
+    }
+    let verity_dir = VerityTempDir::new()?;
+    let mut repo = strict_sha512_repo(verity_dir.path())?;
+    repo.set_erofs_version(FormatVersion::V1);
+    let repo = Arc::new(repo);
+    let component = |digest, target: &str| ImageSetComponent {
+        digest,
+        format: FormatVersion::V1,
+        target: target.into(),
+    };
+
+    for (top, refused) in [("abc", false), ("ab", true)] {
+        let fixture_dir = tempfile::tempdir()?;
+        let rootfs = create_test_rootfs(fixture_dir.path())?;
+        std::fs::create_dir_all(rootfs.join("usr/lib/modules/6.1.0"))?;
+        std::fs::write(rootfs.join("usr/lib/modules/6.1.0/modules.dep"), "\n")?;
+        std::fs::create_dir_all(rootfs.join(top).join("x"))?;
+        std::fs::write(rootfs.join(top).join("keep"), "keep\n")?;
+        std::fs::write(rootfs.join(top).join("x/payload"), "payload\n")?;
+
+        let target = format!("/{top}/x");
+        let mut fs = read_rootfs(&repo, &rootfs)?;
+        let modules = fs.split_off(OsStr::new("/usr/lib/modules"))?;
+        let x = fs.split_off(OsStr::new(&target))?;
+        let set = match ImageSet::new(vec![
+            component(fs.commit_image(&repo, None)?, "/"),
+            component(modules.commit_image(&repo, None)?, "/usr/lib/modules"),
+            component(x.commit_image(&repo, None)?, &target),
+        ]) {
+            Err(err) => {
+                ensure!(refused, "{target}: {err}");
+                ensure!(
+                    err.to_string().contains("named like the whiteout stubs"),
+                    "{target}: {err}"
+                );
+                continue;
+            }
+            Ok(set) => set,
+        };
+        let id = repo.write_image_set(None, &set)?.to_hex();
+        check_image_set_mount(&repo, &id, |mnt| {
+            let read = |path: &str| std::fs::read_to_string(mnt.join(path));
+            ensure!(read(&format!("{top}/keep"))? == "keep\n");
+            ensure!(read("usr/lib/modules/6.1.0/modules.dep")? == "\n");
+            let payload = read(&format!("{top}/x/payload"));
+            ensure!(
+                payload.as_deref().ok() == Some("payload\n"),
+                "{target}/payload: {payload:?}"
+            );
+            Ok(())
+        })
+        .with_context(|| format!("image set with target {target}"))?;
+        ensure!(!refused, "{target}: accepted");
+    }
+    Ok(())
+}
+integration_test!(privileged_image_set_stub_named_target);
+
 /// Verify that `init` on a verity-capable filesystem enables verity on
 /// meta.json, and that `--require-verity` succeeds on such a repo.
 fn privileged_init_enables_verity() -> Result<()> {
